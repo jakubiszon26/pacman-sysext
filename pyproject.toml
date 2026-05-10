@@ -1,0 +1,72 @@
+[project]
+name = "pacman-sysext"
+version = "0.1.0"
+description = "Install pacman packages as systemd-sysext images on Arch-based systems"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Jakub Kołakowski", email = "jakubkolakowski6@protonmail.com" }
+]
+requires-python = ">=3.13"
+keywords = ["arch", "pacman", "systemd", "sysext", "cachyos"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Installation/Setup",
+    "Topic :: System :: Software Distribution",
+]
+dependencies = [
+    "typer>=0.25.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/jakubkolakowski6/pacman-sysext"
+Issues = "https://github.com/jakubkolakowski6/pacman-sysext/issues"
+
+[project.scripts]
+pacman-sysext = "pacman_sysext.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer relies on calling Option/Argument in default expressions.
+"src/pacman_sysext/cli.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
