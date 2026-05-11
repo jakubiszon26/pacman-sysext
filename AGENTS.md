@@ -63,6 +63,7 @@ All four must pass before a change can be merged. Configure in `pyproject.toml`.
 - `pytest`. Unit tests only, with mocks; tests run as a normal user, never as root.
 - Mock `subprocess.run` and filesystem boundaries. Use the `tmp_path` fixture for real, throwaway files.
 - Don't shell out to real `pacman` / `systemd-sysext` / `tar` in tests.
+  - **Exception:** `tests/test_version.py` calls the real `vercmp` binary. It is hermetic (pure function of args), tiny, stable, and part of pacman; reimplementing its semantics in mocks defeats the point of the module.
 - Integration testing on real systems is the maintainer's job, not CI's.
 - Tests live in `tests/` and mirror the `src/pacman_sysext/` layout (`tests/test_builder.py`, etc.).
 

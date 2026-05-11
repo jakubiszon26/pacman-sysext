@@ -9,10 +9,13 @@ by deleting its image and refreshing.
 
 ## Status
 
-Early alpha. The `install` command works partialy; `remove` and `list` are
-stubs that raise `NotImplementedError`. Only the squashfs and erofs backends
-are wired up, and packages that ship `/etc` or `/var` are dropped with a
-warning until the systemd factory pattern is implemented.
+Early alpha. The `install` command works partialy and now tracks state in a
+JSON file (default `/var/lib/pacman-sysext/state.db`), including per-sysext
+SHA-256 integrity, dependency constraints, content-hashed base snapshots, and
+ABI-drift warnings on subsequent installs. `remove` and `list` are still stubs
+that raise `NotImplementedError`. Only the squashfs and erofs backends are
+wired up, and packages that ship `/etc` or `/var` are dropped with a warning
+until the systemd factory pattern is implemented.
 
 ## Requirements
 

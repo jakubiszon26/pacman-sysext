@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 from pacman_sysext.config import PacmanConfig
+from pacman_sysext.version import VersionConstraint, parse_constraint
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,85 @@ def query_system_packages() -> dict[str, str]:
         packages[name] = version
 
     return packages
+
+
+# Packages whose version changes are most likely to affect sysext ABI compatibility.
+# This list is a heuristic starting point. Configurable overrides are a follow-up.
+ABI_RELEVANT_PACKAGES: frozenset[str] = frozenset(
+    {
+        "glibc",
+        "gcc-libs",
+        "ncurses",
+        "openssl",
+        "zlib",
+        "icu",
+        "libxml2",
+        "readline",
+        "pcre2",
+        "expat",
+    }
+)
+
+
+def get_package_version(package: str, config: PacmanConfig) -> str:
+    """Return the version of `package` as known to the sync databases."""
+    info = get_package_info(package, config)
+    version = info.get("Version", "").strip()
+    if not version:
+        raise PacmanError(
+            f"pacman -Si {package} returned no Version field",
+            returncode=0,
+            stderr="",
+            stdout="",
+        )
+    return version
+
+
+def get_package_dependencies(package: str, config: PacmanConfig) -> list[VersionConstraint]:
+    """Parsed `Depends On` for `package`. Returns empty list when 'None'."""
+    info = get_package_info(package, config)
+    raw = info.get("Depends On", "").strip()
+    if not raw or raw == "None":
+        return []
+    return [parse_constraint(entry) for entry in raw.split() if entry]
+
+
+def get_package_provides(package: str, config: PacmanConfig) -> dict[str, str]:
+    """Parsed `Provides` for `package`. Pinned `name=version` stays pinned; bare name maps to ''."""
+    info = get_package_info(package, config)
+    raw = info.get("Provides", "").strip()
+    if not raw or raw == "None":
+        return {}
+    result: dict[str, str] = {}
+    for entry in raw.split():
+        name, sep, version = entry.partition("=")
+        result[name] = version if sep else ""
+    return result
+
+
+def get_base_snapshot(packages: frozenset[str] = ABI_RELEVANT_PACKAGES) -> dict[str, str]:
+    """Return name → version for ABI-relevant host packages that are actually installed.
+
+    Packages from `packages` not installed on the host are silently
+    omitted; the set is a heuristic and not all distros ship all of
+    these. `pacman -Q` exits 1 when any requested package is missing but
+    still prints info for the present ones, so we parse stdout
+    regardless of exit code.
+    """
+    if not packages:
+        return {}
+    result = _run_host_pacman(["-Q", *sorted(packages)])
+    snapshot: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            name, version = stripped.split(" ", 1)
+        except ValueError:
+            continue
+        snapshot[name] = version
+    return snapshot
 
 
 def _parse_pacman_info(output: str) -> dict[str, str]:
