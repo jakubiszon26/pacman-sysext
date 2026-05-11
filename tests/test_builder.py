@@ -9,6 +9,7 @@ from pacman_sysext.builder import (
     _make_image,
     _strip_unsupported_dirs,
     _systemd_arch,
+    sanitize_image_name,
 )
 
 
@@ -62,3 +63,17 @@ class TestMakeImage:
     def test_unsupported_format(self, tmp_path: Path) -> None:
         with pytest.raises(BuildError, match="Unsupported"):
             _make_image(tmp_path, tmp_path / "out.raw", "ext4")  # type: ignore[arg-type]
+
+
+class TestSanitizeImageName:
+    def test_no_special_chars_is_identity(self) -> None:
+        assert sanitize_image_name("htop", "3.5.1-1") == "htop-3.5.1-1"
+
+    def test_epoch_colon_replaced_with_plus(self) -> None:
+        # `:` is the overlayfs lowerdir separator — must be escaped or
+        # `systemd-sysext refresh` fails with "No such file or directory".
+        assert sanitize_image_name("lensfun", "1:0.3.4-6.1") == "lensfun-1+0.3.4-6.1"
+
+    def test_comma_replaced_with_underscore(self) -> None:
+        # Defensive: `,` is the overlayfs mount option separator.
+        assert sanitize_image_name("pkg", "1,0-1") == "pkg-1_0-1"

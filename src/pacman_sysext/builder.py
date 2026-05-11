@@ -194,6 +194,22 @@ def _make_image(source: Path, output: Path, fs_format: FsFormat) -> None:
     backend(source, output)
 
 
+def sanitize_image_name(pkg_name: str, pkg_version: str) -> str:
+    """Form the on-disk image basename, escaping characters overlayfs reserves.
+
+    Overlayfs uses `:` as the `lowerdir` separator and `,` as the option
+    separator. Pacman versions may contain `:` for epoch (e.g. `1:0.3.4`),
+    which would make `systemd-sysext refresh` concatenate paths ambiguously
+    when assembling the lowerdir list — the kernel reports "No such file or
+    directory" on the resulting bogus components. `,` doesn't appear in real
+    pacman versions, but we escape it defensively.
+
+    The `version` field stored in state stays untouched so vercmp still
+    compares against the upstream version; only the filename is escaped.
+    """
+    return f"{pkg_name}-{pkg_version}".replace(":", "+").replace(",", "_")
+
+
 def build_sysext(
     pkg_file: Path,
     output_dir: Path,
@@ -213,7 +229,7 @@ def build_sysext(
         raise BuildError(f"Package file not found: {pkg_file}")
 
     pkg_name, pkg_version = parse_pkg_filename(pkg_file)
-    image_name = f"{pkg_name}-{pkg_version}"
+    image_name = sanitize_image_name(pkg_name, pkg_version)
     logger.info("Building sysext for %s (%s)", image_name, fs_format)
 
     output_dir.mkdir(parents=True, exist_ok=True)
