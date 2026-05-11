@@ -29,9 +29,15 @@ def root(
 
 
 @app.command()
-def install(ctx: typer.Context, package: str) -> None:
+def install(
+    ctx: typer.Context,
+    package: str,
+    assume_yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip confirmation prompts (for automation)."
+    ),
+) -> None:
     """Install package as sysext."""
-    install_cmd.run(package, ctx.obj)
+    install_cmd.run(package, ctx.obj, assume_yes=assume_yes)
 
 
 @app.command()

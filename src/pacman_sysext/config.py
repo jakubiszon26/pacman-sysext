@@ -43,7 +43,6 @@ class BuilderConfig:
     """.raw builder configuration."""
 
     output_dir: Path
-    staging_dir: Path
     fs_format: FsFormat = "squashfs"
 
     def __post_init__(self) -> None:
@@ -88,10 +87,7 @@ class AppConfig:
                 config_file=Path("/etc/pacman.conf"),
                 gpgdir=Path("/etc/pacman.d/gnupg"),
             ),
-            builder=BuilderConfig(
-                output_dir=base / "sysexts",
-                staging_dir=Path("/tmp/pacman-sysext-staging"),
-            ),
+            builder=BuilderConfig(output_dir=base / "sysexts"),
             sysext=SysextConfig(),
             state_db=base / "state.db",
         )

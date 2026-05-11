@@ -26,7 +26,7 @@ def _config(tmp_path: Path) -> AppConfig:
             config_file=base / "pacman.conf",
             gpgdir=base / "gnupg",
         ),
-        builder=BuilderConfig(output_dir=base / "sysexts", staging_dir=base / "staging"),
+        builder=BuilderConfig(output_dir=base / "sysexts"),
         sysext=SysextConfig(extensions_dir=base / "extensions"),
         state_db=base / "state.db",
     )
@@ -630,6 +630,37 @@ class TestConflictMessage:
 
         out = capsys.readouterr().out
         assert "Known libuv versions in state: 1.45-1" in out
+
+
+class TestAssumeYes:
+    def test_assume_yes_skips_confirm_prompts(
+        self, tmp_path: Path, mocked: dict[str, MagicMock]
+    ) -> None:
+        # We re-patch `_confirm` to a real function that fails if input() is
+        # touched, ensuring assume_yes really bypasses interactive code.
+        from pacman_sysext.commands import install as install_mod
+
+        def real_confirm(prompt: str, assume_yes: bool = False) -> bool:
+            if assume_yes:
+                return True
+            raise AssertionError("input() should not be called when assume_yes is True")
+
+        mocked["_confirm"].side_effect = real_confirm
+
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
+        mocked["get_package_version"].return_value = "3.5.1-1"
+        mocked["get_package_dependencies"].return_value = []
+        mocked["find_unsatisfied"].return_value = {"htop"}
+        _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
+
+        install_mod.run("htop", config, assume_yes=True)
+
+        # Both prompts (build + activate) should have been called with assume_yes=True.
+        assert mocked["_confirm"].call_count == 2
+        for call in mocked["_confirm"].call_args_list:
+            assert call.kwargs.get("assume_yes") is True
 
 
 class TestConstraintsOverlap:

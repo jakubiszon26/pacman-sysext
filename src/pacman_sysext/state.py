@@ -124,8 +124,12 @@ def save(state: State, path: Path) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        # 0600: state lists every sysext, every dep, host pkg versions at snapshot
-        # time — not secrets, but no reason to expose to all local users either.
+        # mkstemp already creates the tempfile with 0o600 and os.replace
+        # preserves it, so this chmod is defensive — guards against an
+        # umask-shifting fork or a future refactor that swaps mkstemp for
+        # NamedTemporaryFile. State lists every sysext, dep, and host
+        # pkg version at snapshot time — not secrets, but no reason to
+        # expose to other local users.
         path.chmod(0o600)
     except Exception:
         tmp.unlink(missing_ok=True)

@@ -2,6 +2,7 @@
 
 import logging
 import platform
+import posixpath
 import shutil
 import subprocess
 import tempfile
@@ -74,6 +75,55 @@ def _run(cmd: list[str], failure_msg: str) -> None:
         raise BuildError(msg)
 
 
+_MAX_UNSAFE_PATHS_REPORTED = 10
+
+
+def _validate_archive_members(pkg_file: Path) -> None:
+    """List archive members and refuse anything that could escape the staging dir.
+
+    GNU tar 1.32+ already rejects `..` and symlink-based escapes during
+    extraction, but we run as root and don't want to rely on that — a
+    pre-flight check fails fast, deterministically, and survives regressions
+    in tar or a non-GNU implementation on PATH.
+    """
+    try:
+        result = subprocess.run(
+            ["tar", "-tf", str(pkg_file)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as e:
+        raise BuildError(f"tar not found while validating {pkg_file.name}") from e
+    except subprocess.CalledProcessError as e:
+        msg = f"tar failed to list members of {pkg_file.name}"
+        if e.stderr.strip():
+            msg += f"\nstderr: {e.stderr.rstrip()}"
+        raise BuildError(msg) from e
+
+    unsafe: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        member = raw_line.rstrip("/")
+        if not member:
+            continue
+        if "\x00" in member or member.startswith("/") or _has_parent_segment(member):
+            unsafe.append(raw_line)
+            if len(unsafe) >= _MAX_UNSAFE_PATHS_REPORTED:
+                break
+
+    if unsafe:
+        listing = "\n".join(f"  {p}" for p in unsafe)
+        raise BuildError(
+            f"refusing to extract {pkg_file.name}: archive contains unsafe paths:\n{listing}"
+        )
+
+
+def _has_parent_segment(member: str) -> bool:
+    """True if any path segment of `member` is `..` after posix normalization."""
+    normalized = posixpath.normpath(member)
+    return any(segment == ".." for segment in normalized.split("/"))
+
+
 def _extract_package(pkg_file: Path, dest: Path) -> None:
     """Extract a pacman package to destination directory.
 
@@ -82,6 +132,7 @@ def _extract_package(pkg_file: Path, dest: Path) -> None:
     compression from magic bytes, so this works for .pkg.tar.zst /
     .pkg.tar.xz / .pkg.tar.gz alike.
     """
+    _validate_archive_members(pkg_file)
     logger.debug("Extracting %s to %s", pkg_file.name, dest)
     _run(
         ["tar", "-xf", str(pkg_file), "-C", str(dest)],

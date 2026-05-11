@@ -1,14 +1,17 @@
+import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from pacman_sysext.builder import (
     BuildError,
     _clean_arch_metadata,
+    _extract_package,
     _make_image,
     _strip_unsupported_dirs,
     _systemd_arch,
+    _validate_archive_members,
     sanitize_image_name,
 )
 
@@ -77,3 +80,71 @@ class TestSanitizeImageName:
     def test_comma_replaced_with_underscore(self) -> None:
         # Defensive: `,` is the overlayfs mount option separator.
         assert sanitize_image_name("pkg", "1,0-1") == "pkg-1_0-1"
+
+
+def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> MagicMock:
+    proc = MagicMock(spec=subprocess.CompletedProcess)
+    proc.stdout = stdout
+    proc.stderr = stderr
+    proc.returncode = returncode
+    return proc
+
+
+class TestValidateArchiveMembers:
+    def test_clean_listing_passes(self, tmp_path: Path) -> None:
+        listing = ".PKGINFO\n.MTREE\nusr/\nusr/bin/htop\nusr/share/man/man1/htop.1.gz\n"
+        with patch("pacman_sysext.builder.subprocess.run", return_value=_completed(stdout=listing)):
+            _validate_archive_members(tmp_path / "fake.pkg.tar.zst")
+
+    @pytest.mark.parametrize(
+        "bad_member",
+        [
+            "../etc/passwd",
+            "../../tmp/pwned",
+            "usr/bin/../../../etc/cron.d/x",
+            "/etc/passwd",
+            "/absolute/path",
+        ],
+    )
+    def test_rejects_unsafe_paths(self, tmp_path: Path, bad_member: str) -> None:
+        listing = f"usr/bin/htop\n{bad_member}\n"
+        with (
+            patch("pacman_sysext.builder.subprocess.run", return_value=_completed(stdout=listing)),
+            pytest.raises(BuildError, match="unsafe paths"),
+        ):
+            _validate_archive_members(tmp_path / "fake.pkg.tar.zst")
+
+    def test_null_byte_rejected(self, tmp_path: Path) -> None:
+        listing = "usr/bin/htop\nusr/evil\x00.txt\n"
+        with (
+            patch("pacman_sysext.builder.subprocess.run", return_value=_completed(stdout=listing)),
+            pytest.raises(BuildError, match="unsafe paths"),
+        ):
+            _validate_archive_members(tmp_path / "fake.pkg.tar.zst")
+
+    def test_tar_failure_becomes_build_error(self, tmp_path: Path) -> None:
+        err = subprocess.CalledProcessError(returncode=2, cmd=["tar"], stderr="bad magic")
+        with (
+            patch("pacman_sysext.builder.subprocess.run", side_effect=err),
+            pytest.raises(BuildError, match="failed to list members"),
+        ):
+            _validate_archive_members(tmp_path / "fake.pkg.tar.zst")
+
+    def test_missing_tar_becomes_build_error(self, tmp_path: Path) -> None:
+        with (
+            patch("pacman_sysext.builder.subprocess.run", side_effect=FileNotFoundError),
+            pytest.raises(BuildError, match="tar not found"),
+        ):
+            _validate_archive_members(tmp_path / "fake.pkg.tar.zst")
+
+
+class TestExtractPackageValidates:
+    def test_validation_runs_before_extraction(self, tmp_path: Path) -> None:
+        # tar -tf returns an unsafe path → no second call to tar -xf.
+        listing = _completed(stdout="../../etc/passwd\n")
+        with patch("pacman_sysext.builder.subprocess.run", return_value=listing) as run_mock:
+            with pytest.raises(BuildError, match="unsafe paths"):
+                _extract_package(tmp_path / "fake.pkg.tar.zst", tmp_path / "dest")
+            # Only the listing call ran; extraction was skipped.
+            assert run_mock.call_count == 1
+            assert run_mock.call_args.args[0][:2] == ["tar", "-tf"]

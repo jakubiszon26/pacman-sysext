@@ -50,7 +50,9 @@ class BuildPlan:
     integrity_failures: list[str] = field(default_factory=list)
 
 
-def _confirm(prompt: str) -> bool:
+def _confirm(prompt: str, assume_yes: bool = False) -> bool:
+    if assume_yes:
+        return True
     while True:
         answer = input(f"\n{prompt} [y/n]: ").strip().lower()
         if answer in {"y", "yes"}:
@@ -263,7 +265,7 @@ def _cleanup_outputs(outputs: list[Path]) -> None:
             logger.warning("Could not clean up orphaned %s: %s", output, e)
 
 
-def run(package: str, config: AppConfig) -> None:
+def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
     print(f"Installing sysext ({package})...")
     build_outputs: list[Path] = []
     reused_outputs: list[Path] = []
@@ -325,14 +327,14 @@ def run(package: str, config: AppConfig) -> None:
             reused_outputs = _collect_reused_outputs(
                 current_state, plan.reused, config.builder.output_dir
             )
-            _maybe_activate(reused_outputs, config)
+            _maybe_activate(reused_outputs, config, assume_yes=assume_yes)
             return
 
         print(f"\nWill build {len(plan.to_build)} sysext(s):")
         for pkg in plan.to_build:
             print(f"  - {pkg}")
 
-        if not _confirm("Proceed with build?"):
+        if not _confirm("Proceed with build?", assume_yes=assume_yes):
             print("Aborted by user")
             return
 
@@ -388,10 +390,10 @@ def run(package: str, config: AppConfig) -> None:
             current_state, plan.reused, config.builder.output_dir
         )
 
-    _maybe_activate(build_outputs + reused_outputs, config)
+    _maybe_activate(build_outputs + reused_outputs, config, assume_yes=assume_yes)
 
 
-def _maybe_activate(outputs: list[Path], config: AppConfig) -> None:
+def _maybe_activate(outputs: list[Path], config: AppConfig, assume_yes: bool = False) -> None:
     """Symlink and merge sysexts. Called outside the state lock.
 
     Known limitation: a SIGKILL between `state.save()` and a successful
@@ -406,7 +408,7 @@ def _maybe_activate(outputs: list[Path], config: AppConfig) -> None:
     for raw in outputs:
         print(f"  - {raw.name}")
 
-    if not _confirm("Activate now?"):
+    if not _confirm("Activate now?", assume_yes=assume_yes):
         print("Built but not activated. Run `sudo systemd-sysext refresh` after linking manually.")
         return
 
