@@ -9,13 +9,37 @@ by deleting its image and refreshing.
 
 ## Status
 
-Early alpha. The `install` command works partialy and now tracks state in a
-JSON file (default `/var/lib/pacman-sysext/state.db`), including per-sysext
-SHA-256 integrity, dependency constraints, content-hashed base snapshots, and
-ABI-drift warnings on subsequent installs. `remove` and `list` are still stubs
-that raise `NotImplementedError`. Only the squashfs and erofs backends are
-wired up, and packages that ship `/etc` or `/var` are dropped with a warning
-until the systemd factory pattern is implemented.
+Alpha. The `install` and `status` commands are functional. `remove`, `list`,
+and `rebuild` are not implemented yet and will raise `NotImplementedError`.
+The tool tracks state in a JSON file (default `/var/lib/pacman-sysext/state.db`),
+including per-sysext SHA-256 integrity, dependency constraints, content-hashed
+base snapshots, and ABI-drift warnings on subsequent installs. Packages that
+ship `/etc` or `/var` are translated into tmpfiles recipes so their content is
+materialized on the host after activation.
+
+## Features
+
+- Build systemd-sysext images from pacman packages and their dependencies
+  (squashfs or erofs).
+- Sandboxed pacman db/cache for sync and downloads; host `pacman -T` is used to
+  skip dependencies already provided by the base system.
+- Activation via `systemd-sysext refresh` when available, with merge fallback.
+- Post-activation hooks run in order: `systemctl daemon-reload`,
+  `systemd-sysusers`, `systemd-tmpfiles --create`.
+- `/etc` and `/var` payloads are moved into the image and materialized via
+  generated tmpfiles.d recipes.
+- State tracking with locking, integrity checks, dependency metadata, and base
+  ABI snapshots.
+
+## Commands
+
+- `pacman-sysext install <package>` - build and activate sysexts for a target
+  package and its dependencies.
+- `pacman-sysext status` - audit sysext integrity and show explicit/implicit
+  packages, orphans, and disk usage.
+- `pacman-sysext remove <package>` - not implemented yet.
+- `pacman-sysext list` - not implemented yet.
+- `pacman-sysext rebuild` - not implemented yet.
 
 ## Requirements
 
@@ -56,16 +80,7 @@ In the spirit of full transparency, Artificial Intelligence tools (such as LLMs 
 
 The AI was actively utilized for:
 
-- **Code Generation:** Scaffolding components, writing specific functions, and reducing boilerplate.
-- **Architecture & Design:** Brainstorming structural decisions and evaluating design patterns.
-- **Debugging & Refactoring:** Spotting logical errors, suggesting optimizations, and improving overall code readability.
-
-**Verification and Testing Workflow**
-While AI provided significant assistance, it did not operate autonomously. To maintain high security and code quality standards, a strict review process was enforced:
-
-- **Manual Review:** Every single AI suggestion was read, understood, and manually evaluated before being integrated into the codebase.
-
-- **Testing:** AI-generated logic was rigorously validated through testing. This ensures that the generated functions actually work as intended, handle edge cases, and do not introduce silent regressions or vulnerabilities.
+Parts of the work were completed autonomously by AI agents and then reviewed through a mix of human checks and verification by other AI models, with a strong emphasis on security and testing.
 
 ## License
 
