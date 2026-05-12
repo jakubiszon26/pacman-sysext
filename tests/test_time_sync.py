@@ -308,6 +308,8 @@ class TestRenderPinnedPacmanConf:
             "SigLevel = Optional TrustAll",
             "SigLevel = PackageOptional DatabaseRequired",
             "SigLevel = Required TrustAll",
+            "SigLevel = Required PackageTrustAll",
+            "SigLevel = Required DatabaseTrustAll",
         ],
     )
     def test_strips_weakening_siglevel_in_mapped_repo_section(

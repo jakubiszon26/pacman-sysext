@@ -41,9 +41,12 @@ _KEY_RE = re.compile(r"^\s*([A-Za-z]\w*)\s*=")
 # Tokens that weaken pacman signature verification. Bare `Never`/`Optional`
 # affect both packages and DBs; `Package*` variants weaken package sigs
 # specifically (the resolver fetches packages, so this matters). `TrustAll`
-# accepts signatures from unknown keys — equivalent to no verification
-# for any key the host doesn't already trust. `DatabaseOptional` is
-# pacman's compiled-in default and is intentionally NOT flagged.
+# accepts signatures from unknown keys — equivalent to no verification for
+# any key the host doesn't already trust. Pacman accepts `Package`/`Database`
+# prefixes on every trust selector, so `PackageTrustAll`/`DatabaseTrustAll`
+# both bypass the keyring half of verification and are listed alongside
+# the bare form. `DatabaseOptional` is pacman's compiled-in default and is
+# intentionally NOT flagged.
 _WEAKENING_SIGLEVEL_TOKENS = frozenset(
     {
         "never",
@@ -52,6 +55,8 @@ _WEAKENING_SIGLEVEL_TOKENS = frozenset(
         "optional",
         "packageoptional",
         "trustall",
+        "packagetrustall",
+        "databasetrustall",
     }
 )
 

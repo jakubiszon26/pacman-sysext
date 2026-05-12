@@ -129,7 +129,14 @@ def _render(
     console.print(_summary_table(explicit, implicit, orphans, sizes))
 
     if host_snapshot_date is not None:
-        hint = _snapshot_drift_hint(explicit + implicit, host_snapshot_date)
+        # Orphans participate too: a stale pinned orphan still occupies the
+        # output dir and may be re-promoted via reinstall, so its drift is
+        # actionable signal — and the gating in `_maybe_host_snapshot_date`
+        # already counts orphans as evidence that the user opted into
+        # time-sync at some point.
+        hint = _snapshot_drift_hint(
+            [*explicit, *implicit, *orphans], host_snapshot_date
+        )
         if hint is not None:
             console.print(hint)
 

@@ -493,6 +493,47 @@ def test_no_drift_hint_without_pinned_records(
     assert calls == []
 
 
+def test_drift_hint_fires_for_pinned_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pinned record kept around as an orphan still drifts.
+
+    Orphan sysexts stay on disk until removed and can be re-promoted via
+    a reinstall, so their pinned_date matters. The hint must reflect them
+    consistently with the derivation-gating logic.
+    """
+    config = _config(tmp_path)
+    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
+    raw_bytes = b"orphan"
+    (config.builder.output_dir / "orphan-1.0-1.raw").write_bytes(raw_bytes)
+
+    current = state.State()
+    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
+    # No user request → record is an orphan.
+    state.add_sysext(
+        current,
+        _record(
+            "orphan",
+            "1.0-1",
+            snapshot_id=snap_id,
+            sha=hashlib.sha256(raw_bytes).hexdigest(),
+            pinned_date=date(2025, 5, 1),
+        ),
+    )
+    state.save(current, config.state_db)
+
+    monkeypatch.setattr(
+        "pacman_sysext.commands.status.time_sync.derive_snapshot_date",
+        lambda _path: date(2025, 5, 8),
+    )
+
+    console = _capturing_console()
+    status_cmd.run(config, console=console)
+    out = console.export_text()
+    assert "pinned to 2025-05-01" in out
+    assert "host snapshot is now 2025-05-08" in out
+
+
 def test_drift_hint_swallows_derive_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
