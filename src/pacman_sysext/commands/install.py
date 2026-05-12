@@ -359,6 +359,11 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
                 except PacmanError as e:
                     logger.warning("Could not query provides for %s: %s; recording empty", name, e)
                     provides = {}
+                try:
+                    depends = [c.name for c in get_package_dependencies(name, config.pacman)]
+                except PacmanError as e:
+                    logger.warning("Could not query depends for %s: %s; recording empty", name, e)
+                    depends = []
 
                 state.add_sysext(
                     current_state,
@@ -371,6 +376,7 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
                         installed_at=datetime.now(UTC),
                         snapshot_id=snapshot_id,
                         provides=provides,
+                        depends=depends,
                     ),
                 )
 

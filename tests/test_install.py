@@ -91,9 +91,14 @@ class TestFreshInstall:
             "libcap-2.78-1-x86_64.pkg.tar.zst",
         ]
         mocked["get_package_version"].return_value = "3.5.1-1"
-        mocked["get_package_dependencies"].return_value = [
-            VersionConstraint("libcap", ">=", "2.78"),
-        ]
+
+        def deps_for(name: str, _config: object) -> list[VersionConstraint]:
+            return {
+                "htop": [VersionConstraint("libcap", ">=", "2.78")],
+                "libcap": [],
+            }[name]
+
+        mocked["get_package_dependencies"].side_effect = deps_for
         # libcap is not on host → it must be built; htop always built
         mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
         _seed_cache(
@@ -115,6 +120,41 @@ class TestFreshInstall:
         assert len(snap_ids) == 1
         # snapshot interned once
         assert list(result.snapshots.keys()) == list(snap_ids)
+        # depends recorded per built record
+        assert result.sysexts["htop-3.5.1-1"].depends == ["libcap"]
+        assert result.sysexts["libcap-2.78-1"].depends == []
+
+    def test_depends_query_failure_records_empty_depends(
+        self, tmp_path: Path, mocked: dict[str, MagicMock]
+    ) -> None:
+        from pacman_sysext.pacman import PacmanError
+
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        mocked["get_required_packages"].return_value = [
+            "htop-3.5.1-1-x86_64.pkg.tar.zst",
+            "libcap-2.78-1-x86_64.pkg.tar.zst",
+        ]
+        mocked["get_package_version"].return_value = "3.5.1-1"
+
+        def deps_for(name: str, _config: object) -> list[VersionConstraint]:
+            if name == "libcap":
+                raise PacmanError("simulated", returncode=1, stderr="boom")
+            return [VersionConstraint("libcap", ">=", "2.78")]
+
+        mocked["get_package_dependencies"].side_effect = deps_for
+        mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
+        _seed_cache(
+            config.pacman.cachedir,
+            ["htop-3.5.1-1-x86_64.pkg.tar.zst", "libcap-2.78-1-x86_64.pkg.tar.zst"],
+        )
+
+        install.run("htop", config)
+
+        result = state.load(config.state_db)
+        assert result.sysexts["htop-3.5.1-1"].depends == ["libcap"]
+        # libcap's depends query failed mid-build but the install completed.
+        assert result.sysexts["libcap-2.78-1"].depends == []
 
 
 class TestReinstall:
