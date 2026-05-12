@@ -14,12 +14,14 @@ import pytest
 from pacman_sysext.state import (
     AbiDrift,
     BaseSnapshot,
+    IntegrityReport,
     State,
     StateError,
     SysextRecord,
     UserRequest,
     add_sysext,
     add_user_request,
+    audit_integrity,
     compute_file_sha256,
     compute_snapshot_id,
     find_abi_drift,
@@ -27,6 +29,9 @@ from pacman_sysext.state import (
     find_requirers,
     find_sysexts_by_name,
     find_unsatisfied_requirements,
+    get_explicit,
+    get_implicit,
+    get_orphans,
     get_sysext,
     get_user_request,
     intern_snapshot,
@@ -502,6 +507,166 @@ def test_compute_snapshot_id_known_value() -> None:
     # Lock in canonical hashing format so a future schema change is loud.
     expected = _hash_of(b'{"glibc":"2.39","zlib":"1.3"}')
     assert compute_snapshot_id({"glibc": "2.39", "zlib": "1.3"}) == expected
+
+
+class TestStatusHelpers:
+    def test_get_explicit_returns_matching_records_sorted(self) -> None:
+        state = State()
+        older = SysextRecord(
+            name="htop",
+            version="3.5.0",
+            raw_filename="htop-3.5.0.raw",
+            fs_format="squashfs",
+            sha256="a",
+            installed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            snapshot_id="s1",
+            provides={},
+        )
+        newer = SysextRecord(
+            name="nano",
+            version="7",
+            raw_filename="nano-7.raw",
+            fs_format="squashfs",
+            sha256="b",
+            installed_at=datetime(2026, 5, 1, tzinfo=UTC),
+            snapshot_id="s1",
+            provides={},
+        )
+        add_sysext(state, newer)
+        add_sysext(state, older)
+        add_user_request(state, _make_request("htop", "3.5.0", {}))
+        add_user_request(state, _make_request("nano", "7", {}))
+
+        result = get_explicit(state)
+        assert [r.name for r in result] == ["htop", "nano"]
+
+    def test_get_explicit_skips_when_no_matching_sysext(self) -> None:
+        state = State()
+        add_sysext(state, _make_sysext("htop", "3.5.0"))
+        # user request points at a version that does not exist as a sysext
+        add_user_request(state, _make_request("htop", "999.0", {}))
+        assert get_explicit(state) == []
+
+    def test_get_implicit_walks_depends_without_resolver(self) -> None:
+        state = State()
+        add_sysext(state, _make_sysext("htop", "1", depends=["ncurses"]))
+        add_sysext(state, _make_sysext("ncurses", "1", depends=["glibc-stub"]))
+        add_sysext(state, _make_sysext("glibc-stub", "1"))
+        add_user_request(state, _make_request("htop", "1", {"ncurses": ""}))
+
+        # No resolver: walk reaches both implicit deps via record.depends alone,
+        # and silently terminates at the leaf instead of consulting pacman.
+        result = get_implicit(state, dep_resolver=None)
+        names = {r.name for r in result}
+        assert names == {"ncurses", "glibc-stub"}
+
+    def test_get_implicit_resolver_not_called_when_depends_populated(self) -> None:
+        state = State()
+        # Both records have populated depends → resolver never fires, even
+        # if we pass a poisoned one. This is the perf-invariant of commit 1.
+        add_sysext(state, _make_sysext("htop", "1", depends=["ncurses"]))
+        add_sysext(state, _make_sysext("ncurses", "1", depends=[]))
+        add_user_request(state, _make_request("htop", "1", {"ncurses": ""}))
+
+        calls = 0
+
+        def spy(_name: str) -> list[str]:
+            nonlocal calls
+            calls += 1
+            return []
+
+        # ncurses has depends=[], so the spy fires once at that leaf; htop's
+        # children come from its populated depends.
+        result = get_implicit(state, dep_resolver=spy)
+        assert {r.name for r in result} == {"ncurses"}
+        assert calls == 1
+
+    def test_get_implicit_falls_back_to_resolver_for_empty_depends(self) -> None:
+        state = State()
+        # Legacy record (no depends) sits between htop and zlib in the graph.
+        add_sysext(state, _make_sysext("htop", "1", depends=["ncurses"]))
+        add_sysext(state, _make_sysext("ncurses", "1"))
+        add_sysext(state, _make_sysext("zlib", "1"))
+        add_user_request(state, _make_request("htop", "1", {"ncurses": ""}))
+
+        calls: list[str] = []
+
+        def resolver(name: str) -> list[str]:
+            calls.append(name)
+            return {"ncurses": ["zlib"]}.get(name, [])
+
+        result = get_implicit(state, dep_resolver=resolver)
+        names = {r.name for r in result}
+        assert names == {"ncurses", "zlib"}
+        # Resolver fires exactly once — for the legacy record. zlib has
+        # depends=[] too but the resolver returns [] and the walk ends.
+        assert calls == ["ncurses", "zlib"]
+
+    def test_get_implicit_resolves_provides_aliases(self) -> None:
+        state = State()
+        add_sysext(state, _make_sysext("foo", "1", depends=["zlib"]))
+        add_sysext(
+            state,
+            _make_sysext("zlib-ng-compat", "1", provides={"zlib": "1-1"}),
+        )
+        add_user_request(state, _make_request("foo", "1", {"zlib": ""}))
+
+        result = get_implicit(state)
+        assert [r.name for r in result] == ["zlib-ng-compat"]
+
+    def test_get_implicit_excludes_user_requested(self) -> None:
+        state = State()
+        add_sysext(state, _make_sysext("htop", "1", depends=["ncurses"]))
+        add_sysext(state, _make_sysext("ncurses", "1"))
+        # The user explicitly asked for ncurses too.
+        add_user_request(state, _make_request("htop", "1", {"ncurses": ""}))
+        add_user_request(state, _make_request("ncurses", "1", {}))
+
+        result = get_implicit(state)
+        # ncurses is reachable but is explicit → not implicit.
+        assert result == []
+
+    def test_get_orphans_is_set_difference(self) -> None:
+        state = State()
+        add_sysext(state, _make_sysext("htop", "1", depends=["ncurses"]))
+        add_sysext(state, _make_sysext("ncurses", "1"))
+        add_sysext(state, _make_sysext("leftover", "9"))
+        add_user_request(state, _make_request("htop", "1", {"ncurses": ""}))
+
+        orphans = get_orphans(state)
+        assert [r.name for r in orphans] == ["leftover"]
+
+    def test_audit_integrity_missing_file(self, tmp_path: Path) -> None:
+        sysexts = tmp_path / "sysexts"
+        sysexts.mkdir()
+        state = State()
+        add_sysext(state, _make_sysext("htop", "1"))
+
+        report = audit_integrity(state, sysexts)
+        assert isinstance(report, IntegrityReport)
+        assert [r.name for r in report.missing_files] == ["htop"]
+        assert report.unregistered_files == []
+
+    def test_audit_integrity_unregistered_file(self, tmp_path: Path) -> None:
+        sysexts = tmp_path / "sysexts"
+        sysexts.mkdir()
+        (sysexts / "htop-1.raw").write_bytes(b"data")
+        (sysexts / "stray-2.raw").write_bytes(b"data")
+        # Some clutter that must be ignored:
+        (sysexts / "notes.txt").write_bytes(b"keep me")
+        state = State()
+        add_sysext(state, _make_sysext("htop", "1"))
+
+        report = audit_integrity(state, sysexts)
+        assert report.missing_files == []
+        assert [p.name for p in report.unregistered_files] == ["stray-2.raw"]
+
+    def test_audit_integrity_handles_missing_dir(self, tmp_path: Path) -> None:
+        state = State()
+        add_sysext(state, _make_sysext("htop", "1"))
+        report = audit_integrity(state, tmp_path / "does-not-exist")
+        assert [r.name for r in report.missing_files] == ["htop"]
+        assert report.unregistered_files == []
 
 
 class TestSysextDepends:

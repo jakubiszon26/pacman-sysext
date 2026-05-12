@@ -18,7 +18,7 @@ import logging
 import os
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -100,6 +100,14 @@ class AbiDrift:
     sysext_key: str
     differences: dict[str, tuple[str, str]]
     missing_in_current: list[str]
+
+
+@dataclass(frozen=True)
+class IntegrityReport:
+    """Audit of state.db against the actual sysext output directory."""
+
+    missing_files: list[SysextRecord]
+    unregistered_files: list[Path]
 
 
 def sysext_key(name: str, version: str) -> str:
@@ -347,6 +355,89 @@ def _provider_version(record: SysextRecord, dep_name: str) -> str | None:
     if pinned is None:
         return None
     return pinned if pinned else None
+
+
+def get_explicit(state: State) -> list[SysextRecord]:
+    """SysextRecords the user explicitly requested.
+
+    Resolves each `UserRequest` to the matching `(name, installed_version)`
+    sysext record. Requests without a backing record are skipped silently
+    — that pathology is surfaced by `audit_integrity` instead. Output is
+    sorted by `installed_at` for stable rendering.
+    """
+    matched: list[SysextRecord] = []
+    for req in state.user_requests.values():
+        record = get_sysext(state, req.name, req.installed_version)
+        if record is not None:
+            matched.append(record)
+    matched.sort(key=lambda r: r.installed_at)
+    return matched
+
+
+def get_implicit(
+    state: State,
+    dep_resolver: Callable[[str], list[str]] | None = None,
+) -> list[SysextRecord]:
+    """SysextRecords reachable from user_requests as transitive deps.
+
+    Primary source: each record's `depends` field, read from RAM. The
+    optional `dep_resolver` is consulted only when a reached record has
+    `depends == []` (legacy entries persisted before the field
+    existed). Resolver results are never written back — this function
+    is strictly read-only.
+
+    Walks `provides` aliases via `find_providing_sysexts`, so a dep on
+    `zlib` resolves to a record that lists `zlib` in `provides`.
+    Records that are themselves user-requested are excluded (they
+    belong to explicit, not implicit).
+    """
+    explicit_names = set(state.user_requests.keys())
+    visited: set[str] = set()
+    worklist: list[str] = list(explicit_names)
+    implicit: list[SysextRecord] = []
+
+    while worklist:
+        name = worklist.pop()
+        for record in find_providing_sysexts(state, name):
+            key = sysext_key(record.name, record.version)
+            if key in visited:
+                continue
+            visited.add(key)
+            if record.name not in explicit_names:
+                implicit.append(record)
+            children = record.depends
+            if not children and dep_resolver is not None:
+                children = dep_resolver(record.name)
+            worklist.extend(children)
+    return implicit
+
+
+def get_orphans(
+    state: State,
+    dep_resolver: Callable[[str], list[str]] | None = None,
+) -> list[SysextRecord]:
+    """SysextRecords not reachable as explicit or implicit — cleanup candidates."""
+    explicit = {sysext_key(r.name, r.version) for r in get_explicit(state)}
+    implicit = {sysext_key(r.name, r.version) for r in get_implicit(state, dep_resolver)}
+    return [
+        record
+        for key, record in state.sysexts.items()
+        if key not in explicit and key not in implicit
+    ]
+
+
+def audit_integrity(state: State, sysexts_dir: Path) -> IntegrityReport:
+    """Reconcile state.sysexts with the actual contents of `sysexts_dir`."""
+    registered = {r.raw_filename: r for r in state.sysexts.values()}
+    missing_files = [
+        r for r in state.sysexts.values() if not (sysexts_dir / r.raw_filename).exists()
+    ]
+    if not sysexts_dir.exists():
+        return IntegrityReport(missing_files=missing_files, unregistered_files=[])
+    unregistered_files = [
+        path for path in sorted(sysexts_dir.glob("*.raw")) if path.name not in registered
+    ]
+    return IntegrityReport(missing_files=missing_files, unregistered_files=unregistered_files)
 
 
 def compute_file_sha256(path: Path) -> str:
