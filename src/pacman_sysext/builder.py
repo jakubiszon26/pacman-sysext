@@ -56,7 +56,10 @@ _TMPFILES_DIR = "usr/lib/tmpfiles.d"
 # `systemd-tmpfiles --create`. Anything outside this set could either break
 # parsing or — worse — let a hostile filename inject a directive. Real Arch
 # package names + versions only use a strict subset of this character class.
-_IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+# `\-` (escaped) is identical in meaning to a trailing `-` inside a class,
+# but reads as a literal hyphen rather than a half-formed range — safer
+# under future edits to the class.
+_IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9._+\-]+$")
 
 
 class BuildError(Exception):
@@ -203,16 +206,38 @@ _TMPFILES_ESCAPE_TABLE = str.maketrans(
 )
 
 
-def _escape_tmpfiles_field(value: str) -> str:
-    """C-escape whitespace and backslash per tmpfiles.d(5) parsing rules.
+def _escape_tmpfiles_path(value: str) -> str:
+    """Strict C-escape — no pass-through for `-`.
 
-    The default-marker `-` must pass through verbatim — it signals "use the
-    default" for Mode/User/Group/Age/Argument. Other fields (paths,
-    symlink targets) are unconditionally escaped.
+    Use for fields whose semantic NEVER includes the default marker `-`:
+    directive Path, copy sources, symlink targets, and free-form text we
+    embed in recipe headers. A bare `-` smuggled into one of these slots
+    would silently be misread by systemd-tmpfiles as "use the default",
+    which for Path/Argument means data loss or a no-op directive.
+    """
+    return value.translate(_TMPFILES_ESCAPE_TABLE)
+
+
+def _escape_tmpfiles_meta(value: str) -> str:
+    """C-escape Mode/User/Group/Age fields with `-` as default-marker pass-through.
+
+    tmpfiles.d(5): these four fields treat a literal `-` as "use the
+    implementation default" (umask-derived mode, root:root, no age). We
+    must preserve that semantic verbatim; everything else gets C-escaped
+    so a hostile or malformed numeric string can't break the line.
     """
     if value == "-":
         return value
     return value.translate(_TMPFILES_ESCAPE_TABLE)
+
+
+# Argument's semantic depends on the directive kind. For `C` it is the
+# copy source path; for `L`/`L+` it is the symlink target. In all three
+# cases a bare `-` would be parsed as "use the default" rather than a
+# literal hyphen path — strict-escape so any future caller that hands us
+# a one-character `-` argument fails loudly via tmpfiles parse error
+# instead of silently producing a no-op directive.
+_KINDS_WITH_PATH_ARGUMENT = frozenset({"C", "L", "L+"})
 
 
 def _tmpfiles_line(
@@ -224,17 +249,47 @@ def _tmpfiles_line(
     age: str = "-",
     argument: str = "-",
 ) -> str:
-    """Format one tmpfiles.d directive. Path and Argument are C-escaped."""
+    """Format one tmpfiles.d directive with per-slot escape semantics."""
+    escaped_arg = (
+        _escape_tmpfiles_path(argument)
+        if kind in _KINDS_WITH_PATH_ARGUMENT
+        else _escape_tmpfiles_meta(argument)
+    )
     return " ".join(
         [
             kind,
-            _escape_tmpfiles_field(host_path),
-            mode,
-            uid,
-            gid,
-            age,
-            _escape_tmpfiles_field(argument),
+            _escape_tmpfiles_path(host_path),
+            _escape_tmpfiles_meta(mode),
+            _escape_tmpfiles_meta(uid),
+            _escape_tmpfiles_meta(gid),
+            _escape_tmpfiles_meta(age),
+            escaped_arg,
         ]
+    )
+
+
+# Directories a sysext-shipped symlink may legitimately point into. Anything
+# outside this set after `..`-normalization is rejected at recipe-emit time:
+# without this, a hostile package shipping e.g.
+# `var/lib/foo -> ../../home/user/.ssh/authorized_keys` would, once `L+`
+# materialises it, hand any root-running daemon that reads /var/lib/foo a
+# path to that user's private files. `L` (used for /etc) is partially
+# defended (no overwrite), but the dangling link is still created — enough
+# for a read-side attack.
+_SYMLINK_TARGET_SAFE_ROOTS = ("/usr", "/opt", "/etc", "/var", "/run", "/tmp", "/boot")
+
+
+def _is_safe_symlink_target(host_path: str, target: str) -> bool:
+    """True if `target` resolves to a path under one of the trusted roots."""
+    if posixpath.isabs(target):
+        resolved = posixpath.normpath(target)
+    else:
+        resolved = posixpath.normpath(
+            posixpath.join(posixpath.dirname(host_path), target)
+        )
+    return any(
+        resolved == root or resolved.startswith(root + "/")
+        for root in _SYMLINK_TARGET_SAFE_ROOTS
     )
 
 
@@ -285,6 +340,11 @@ def _translate_etc_and_var(staging: Path, image_name: str) -> None:
     The original /etc and /var trees are deleted from the staging area
     after translation: an empty /etc inside the .raw would shadow the
     host's real /etc through the overlay.
+
+    Known limitation: there is no removal counterpart yet. Files materialised
+    via `C` and symlinks via `L`/`L+` persist on the host after a sysext is
+    deactivated; the upcoming remove command will need to consult the recipe
+    to revert them.
     """
     lines: list[str] = []
     skel_root_rel = Path(_SKEL_DIR) / image_name
@@ -311,7 +371,7 @@ def _translate_etc_and_var(staging: Path, image_name: str) -> None:
     # but escaping costs nothing on a clean string and survives any future
     # weakening of the whitelist. A `\n` smuggled in here would otherwise
     # synthesize a live tmpfiles directive on the very next line.
-    safe_image_name = _escape_tmpfiles_field(image_name)
+    safe_image_name = _escape_tmpfiles_path(image_name)
     header = (
         f"# Generated by pacman-sysext for {safe_image_name}.\n"
         f"# Materialises files this package ships into /etc and /var.\n"
@@ -346,6 +406,14 @@ def _translate_entry(
     if entry.is_symlink():
         target = os.readlink(entry)
         entry.unlink()
+        if not _is_safe_symlink_target(host_path, target):
+            logger.warning(
+                "Skipping symlink %s -> %r: target escapes trusted roots %s",
+                host_path,
+                target,
+                list(_SYMLINK_TARGET_SAFE_ROOTS),
+            )
+            return None
         return _tmpfiles_line(symlink_kind, host_path, "-", "-", "-", "-", target)
 
     if entry.is_dir():

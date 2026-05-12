@@ -396,11 +396,20 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
 def _maybe_activate(outputs: list[Path], config: AppConfig, assume_yes: bool = False) -> None:
     """Symlink and merge sysexts. Called outside the state lock.
 
-    Known limitation: a SIGKILL between `state.save()` and a successful
-    activation leaves state recording the sysexts as installed while
-    systemd has not yet merged them. The recovery is for the user to
-    re-run install (idempotent reuse path) or `sudo systemd-sysext refresh`
-    manually. A future plan may auto-refresh on command startup.
+    Known crash-recovery gaps:
+
+    * SIGKILL between `state.save()` and `activate_all()` leaves state
+      recording the sysexts as installed while systemd has not yet merged
+      them. Recovery: re-run install (idempotent reuse path) or
+      `sudo systemd-sysext refresh && sudo systemd-tmpfiles --create`.
+    * SIGKILL inside `activate_all()` between the `merge`/`refresh` call
+      and the trailing `apply_tmpfiles` is the more painful variant: the
+      sysext is live, /usr is overlaid, but /etc and /var content has not
+      been materialised. Programs may start without their configuration.
+      Recovery is the same `systemd-tmpfiles --create` command above; the
+      tmpfiles directives we ship use `C`/`L` for /etc and so are safe to
+      re-apply over an admin-edited host. A future plan may auto-run this
+      pair on command startup.
     """
     if not outputs:
         return

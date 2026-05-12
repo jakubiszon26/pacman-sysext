@@ -71,14 +71,63 @@ def refresh() -> None:
     _run_sysext(["systemd-sysext", "refresh"])
 
 
-def apply_tmpfiles() -> None:
-    """Run `systemd-tmpfiles --create` against the live root.
+def daemon_reload() -> None:
+    """Force PID 1 to pick up unit files from the freshly merged /usr layer.
 
-    sysext doesn't overlay /etc or /var; the builder converts those paths
-    into a tmpfiles.d recipe shipped at /usr/lib/tmpfiles.d/pacman-sysext-*.conf
-    inside each image. Once the sysext is merged, this call materialises
-    the recipe so directories, copies (`C`), and symlinks (`L+`) appear on
-    the host.
+    `systemd-sysext refresh` swaps the /usr overlay atomically but does not
+    notify PID 1 that new `.service` / `.socket` / `.timer` files exist —
+    systemd keeps its old in-memory unit table until told to reload, so
+    `systemctl start <new-unit>` returns "Unit not found" for anything the
+    just-merged layer ships. Running this immediately after refresh closes
+    that gap before sysusers/tmpfiles touch the host.
+    """
+    logger.info("Reloading systemd daemon")
+    _run_sysext(["systemctl", "daemon-reload"])
+
+
+def apply_sysusers() -> None:
+    """Register system users and groups declared in /usr/lib/sysusers.d/.
+
+    Packages with daemons (valkey, redis, postgres, …) ship sysusers.d
+    snippets that declare the system accounts their files must be owned by.
+    After `systemd-sysext refresh` makes those snippets visible on the live
+    root, we have to commit them to the host's /etc/passwd and /etc/group
+    *before* running `systemd-tmpfiles`: tmpfiles directives that chown a
+    /var/lib/<daemon> tree to its service user otherwise fail silently when
+    the account does not yet exist, leaving the daemon unable to start.
+
+    No scope locking here (unlike `apply_tmpfiles`): `systemd-sysusers` is
+    strictly additive — it creates missing entries and never modifies or
+    removes existing ones — so re-applying every sysusers.d file on the
+    host is safe and idempotent.
+    """
+    logger.info("Registering system users")
+    _run_sysext(["systemd-sysusers"])
+
+
+def apply_tmpfiles() -> None:
+    """Run `systemd-tmpfiles --create` globally against the live root.
+
+    A merged sysext ships two kinds of tmpfiles.d snippets:
+
+    1. Our generated `pacman-sysext-<image>.conf` — materialises /etc and
+       /var content the translator pulled out at build time.
+    2. *Package-native* `<pkg>.conf` straight from Arch upstream
+       (mariadb.conf, redis.conf, postgresql.conf, …) — typically
+       declares the daemon's runtime tree under /run, which is tmpfs and
+       does not survive reboot.
+
+    An earlier revision scoped this call to (1) only, on the principle of
+    minimum blast radius. That broke (2) outright: the canonical reproducer
+    was MariaDB failing with `/run/mariadb/wsrep-start-position: No such
+    file or directory` immediately after install — its native tmpfiles.d
+    rule was silently skipped, so /run/mariadb/ was never created.
+
+    We deliberately revert to the unscoped form. The blast radius is now
+    the same as `systemd-tmpfiles-setup.service` at every boot — any
+    `f`/`F`/`w`/`L+` rule may re-create a file the admin had deleted —
+    but that file would be re-created at the next reboot anyway, so we
+    are not introducing a new failure mode. Daemon correctness wins.
     """
     logger.info("Applying tmpfiles recipes")
     _run_sysext(["systemd-tmpfiles", "--create"])
@@ -115,8 +164,19 @@ def activate_all(raw_paths: list[Path], extensions_dir: Path) -> None:
             unmerge()
         merge()
 
-    # Must run AFTER the sysext is merged so /usr/lib/tmpfiles.d/pacman-sysext-*.conf
-    # is visible on the live root.
+    # Order matters and was paid for in production incidents:
+    #   1. daemon-reload   — PID 1 picks up new `.service`/`.socket`/`.timer`
+    #                        units from the just-swapped /usr; without this,
+    #                        `systemctl start <new-unit>` returns "not found".
+    #   2. sysusers        — commits accounts from /usr/lib/sysusers.d/* to
+    #                        /etc/passwd so the next step has someone to
+    #                        chown to.
+    #   3. tmpfiles        — creates /etc, /var AND /run trees (the last
+    #                        is critical for daemon packages whose runtime
+    #                        state lives on tmpfs).
+    # Any swap silently breaks at least one daemon package.
+    daemon_reload()
+    apply_sysusers()
     apply_tmpfiles()
 
 

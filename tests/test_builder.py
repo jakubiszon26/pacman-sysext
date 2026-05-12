@@ -8,8 +8,10 @@ import pytest
 from pacman_sysext.builder import (
     BuildError,
     _clean_arch_metadata,
-    _escape_tmpfiles_field,
+    _escape_tmpfiles_meta,
+    _escape_tmpfiles_path,
     _extract_package,
+    _is_safe_symlink_target,
     _make_image,
     _strip_unsupported_dirs,
     _systemd_arch,
@@ -77,7 +79,9 @@ class TestStripUnsupportedDirs:
         assert (tmp_path / "usr").exists()
 
 
-class TestEscapeTmpfilesField:
+class TestEscapeTmpfilesPath:
+    """Strict escape — `-` is never the default marker for path-like fields."""
+
     @pytest.mark.parametrize(
         ("raw", "expected"),
         [
@@ -87,11 +91,68 @@ class TestEscapeTmpfilesField:
             ("/etc/tab\there", "/etc/tab\\there"),
             ("/etc/newline\n", "/etc/newline\\n"),
             ("/etc/cr\r", "/etc/cr\\r"),
-            ("-", "-"),  # default marker passes through untouched
+            # A literal "-" must NOT be passed through here — a symlink target
+            # of "-" would otherwise be misread by systemd-tmpfiles as
+            # "use default" and silently produce a no-op directive.
+            ("-", "-"),
         ],
     )
     def test_escapes(self, raw: str, expected: str) -> None:
-        assert _escape_tmpfiles_field(raw) == expected
+        assert _escape_tmpfiles_path(raw) == expected
+
+
+class TestEscapeTmpfilesMeta:
+    """Meta fields: `-` passes through as the tmpfiles.d default marker."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("0755", "0755"),
+            ("0", "0"),
+            ("-", "-"),  # default-marker preserved verbatim
+            ("0 7\t55", "0\\s7\\t55"),  # still escapes pathological numeric strings
+        ],
+    )
+    def test_escapes(self, raw: str, expected: str) -> None:
+        assert _escape_tmpfiles_meta(raw) == expected
+
+
+class TestIsSafeSymlinkTarget:
+    @pytest.mark.parametrize(
+        ("host_path", "target"),
+        [
+            # Absolute targets pointing into trusted roots — fine.
+            ("/etc/foo", "/usr/share/foo/bar"),
+            ("/var/lib/foo", "/run/foo.sock"),
+            ("/etc/baz", "/opt/baz/data"),
+            # Relative targets that stay inside a trusted root.
+            ("/etc/foo", "../usr/share/foo"),  # /etc/.. + usr/share/foo → /usr/share/foo
+            ("/var/lib/foo", "bar"),  # /var/lib/bar
+            ("/var/lib/foo", "./bar"),  # /var/lib/bar
+        ],
+    )
+    def test_accepts_safe(self, host_path: str, target: str) -> None:
+        assert _is_safe_symlink_target(host_path, target) is True
+
+    @pytest.mark.parametrize(
+        ("host_path", "target"),
+        [
+            # The canonical AUR-style exploit: traversal into /home.
+            ("/var/lib/foo", "../../home/user/.ssh/authorized_keys"),
+            # Absolute target outside trusted roots.
+            ("/etc/foo", "/home/user/secret"),
+            ("/etc/foo", "/root/.ssh/authorized_keys"),
+            # Root itself is not trusted (would shadow /).
+            ("/etc/foo", "/"),
+            # Traversal that lands above any trusted root.
+            ("/var/lib/foo", "../../.."),
+            # /sys, /proc are sensitive kernel surfaces — not trusted.
+            ("/etc/foo", "/sys/kernel/security/lsm"),
+            ("/etc/foo", "/proc/self/environ"),
+        ],
+    )
+    def test_rejects_unsafe(self, host_path: str, target: str) -> None:
+        assert _is_safe_symlink_target(host_path, target) is False
 
 
 class TestTmpfilesLine:
