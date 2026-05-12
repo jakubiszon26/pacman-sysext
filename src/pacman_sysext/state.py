@@ -53,7 +53,15 @@ class BaseSnapshot:
 
 @dataclass(frozen=True)
 class SysextRecord:
-    """Metadata for one built sysext image. Identity is (name, version)."""
+    """Metadata for one built sysext image. Identity is (name, version).
+
+    `depends` is the list of direct dependency names recorded at build
+    time. Status and other graph-walking commands read this field
+    instead of re-querying pacman per record. The field defaults to an
+    empty list so records persisted before the field existed keep
+    loading; consumers must treat an empty `depends` as 'unknown' and
+    fall back to pacman only when correctness demands it.
+    """
 
     name: str
     version: str
@@ -63,6 +71,7 @@ class SysextRecord:
     installed_at: datetime
     snapshot_id: str
     provides: dict[str, str]
+    depends: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -433,6 +442,7 @@ def _sysext_to_json(record: SysextRecord) -> dict[str, Any]:
         "installed_at": record.installed_at.isoformat(),
         "snapshot_id": record.snapshot_id,
         "provides": dict(record.provides),
+        "depends": list(record.depends),
     }
 
 
@@ -445,6 +455,11 @@ def _sysext_from_json(data: Any) -> SysextRecord:
     provides = data.get("provides", {})
     if not isinstance(provides, dict):
         raise StateError(f"provides must be an object, got {type(provides).__name__}")
+    # `depends` is additive; absent on records written before the field existed,
+    # so default to [] rather than bumping _SCHEMA_VERSION and breaking installs.
+    depends = data.get("depends", [])
+    if not isinstance(depends, list):
+        raise StateError(f"depends must be a list, got {type(depends).__name__}")
     return SysextRecord(
         name=data["name"],
         version=data["version"],
@@ -454,6 +469,7 @@ def _sysext_from_json(data: Any) -> SysextRecord:
         installed_at=datetime.fromisoformat(data["installed_at"]),
         snapshot_id=data["snapshot_id"],
         provides={str(k): str(v) for k, v in provides.items()},
+        depends=[str(d) for d in depends],
     )
 
 

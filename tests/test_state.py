@@ -52,6 +52,7 @@ def _make_sysext(
     sha: str = "abc",
     snap: str = "snap1",
     provides: dict[str, str] | None = None,
+    depends: list[str] | None = None,
 ) -> SysextRecord:
     return SysextRecord(
         name=name,
@@ -62,6 +63,7 @@ def _make_sysext(
         installed_at=_now(),
         snapshot_id=snap,
         provides=provides or {},
+        depends=depends or [],
     )
 
 
@@ -500,6 +502,73 @@ def test_compute_snapshot_id_known_value() -> None:
     # Lock in canonical hashing format so a future schema change is loud.
     expected = _hash_of(b'{"glibc":"2.39","zlib":"1.3"}')
     assert compute_snapshot_id({"glibc": "2.39", "zlib": "1.3"}) == expected
+
+
+class TestSysextDepends:
+    def test_round_trip_with_depends(self, tmp_path: Path) -> None:
+        state = State()
+        intern_snapshot(state, {"glibc": "2.39-1"})
+        add_sysext(state, _make_sysext("htop", "3.5.1-1", depends=["ncurses", "libcap"]))
+        path = tmp_path / "state.db"
+        save(state, path)
+        reloaded = load(path)
+        assert reloaded == state
+        record = reloaded.sysexts["htop-3.5.1-1"]
+        assert record.depends == ["ncurses", "libcap"]
+
+    def test_legacy_record_without_depends_loads_as_empty(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sysexts": {
+                        "htop-3.5": {
+                            "name": "htop",
+                            "version": "3.5",
+                            "raw_filename": "htop-3.5.raw",
+                            "fs_format": "squashfs",
+                            "sha256": "abc",
+                            "installed_at": _now().isoformat(),
+                            "snapshot_id": "s1",
+                            "provides": {},
+                        }
+                    },
+                    "user_requests": {},
+                    "snapshots": {},
+                }
+            )
+        )
+        state = load(path)
+        record = state.sysexts["htop-3.5"]
+        assert record.depends == []
+
+    def test_depends_must_be_list(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sysexts": {
+                        "htop-3.5": {
+                            "name": "htop",
+                            "version": "3.5",
+                            "raw_filename": "htop-3.5.raw",
+                            "fs_format": "squashfs",
+                            "sha256": "abc",
+                            "installed_at": _now().isoformat(),
+                            "snapshot_id": "s1",
+                            "provides": {},
+                            "depends": "ncurses",
+                        }
+                    },
+                    "user_requests": {},
+                    "snapshots": {},
+                }
+            )
+        )
+        with pytest.raises(StateError, match="depends must be a list"):
+            load(path)
 
 
 def test_os_module_is_used_for_replace_not_pathlib(
