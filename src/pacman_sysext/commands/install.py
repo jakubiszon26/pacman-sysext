@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import typer
@@ -53,12 +53,18 @@ class BuildPlan:
     integrity_failures: list[str] = field(default_factory=list)
 
 
-def _prepare_pacman(config: AppConfig) -> PacmanConfig:
-    """Return the resolver-facing PacmanConfig (sandbox or plain `pacman -Sy`)."""
+def _prepare_pacman(config: AppConfig) -> tuple[PacmanConfig, date | None]:
+    """Return (PacmanConfig, effective pinned date) for the resolver.
+
+    The date is None outside time-sync mode and is propagated into every
+    SysextRecord built in this transaction so status can render the
+    pinned snapshot column.
+    """
     if config.time_sync.enabled:
-        return time_sync.prepare_sandbox(config.time_sync, config.pacman)
+        sandbox = time_sync.prepare_sandbox(config.time_sync, config.pacman)
+        return sandbox.pacman, sandbox.effective_date
     sync_databases(config.pacman)
-    return config.pacman
+    return config.pacman, None
 
 
 def _confirm(prompt: str, assume_yes: bool = False) -> bool:
@@ -412,7 +418,7 @@ def run(
             _warn_about_drift(current_state, current_snapshot)
 
             try:
-                effective_pacman = _prepare_pacman(config)
+                effective_pacman, pinned_date = _prepare_pacman(config)
             except TimeSyncError as e:
                 print(f"Error: {e}")
                 raise typer.Exit(code=1) from e
@@ -544,6 +550,7 @@ def run(
                             snapshot_id=snapshot_id,
                             provides=provides,
                             depends=depends,
+                            pinned_date=pinned_date,
                         ),
                     )
 

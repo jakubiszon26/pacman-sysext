@@ -5,7 +5,7 @@ import json
 import os
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -58,6 +58,7 @@ def _make_sysext(
     snap: str = "snap1",
     provides: dict[str, str] | None = None,
     depends: list[str] | None = None,
+    pinned_date: date | None = None,
 ) -> SysextRecord:
     return SysextRecord(
         name=name,
@@ -69,6 +70,7 @@ def _make_sysext(
         snapshot_id=snap,
         provides=provides or {},
         depends=depends or [],
+        pinned_date=pinned_date,
     )
 
 
@@ -792,6 +794,75 @@ class TestSysextDepends:
         state = load(path)
         record = state.sysexts["htop-3.5"]
         assert record.depends == []
+
+    def test_round_trip_with_pinned_date(self, tmp_path: Path) -> None:
+        state = State()
+        intern_snapshot(state, {"glibc": "2.39-1"})
+        add_sysext(
+            state,
+            _make_sysext("htop", "3.5.1-1", pinned_date=date(2025, 5, 1)),
+        )
+        # A second record without pinning rides along — both must reload.
+        add_sysext(state, _make_sysext("libcap", "2.78-1", pinned_date=None))
+        path = tmp_path / "state.db"
+        save(state, path)
+        reloaded = load(path)
+        assert reloaded == state
+        assert reloaded.sysexts["htop-3.5.1-1"].pinned_date == date(2025, 5, 1)
+        assert reloaded.sysexts["libcap-2.78-1"].pinned_date is None
+
+    def test_legacy_record_without_pinned_date_loads_as_none(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sysexts": {
+                        "htop-3.5": {
+                            "name": "htop",
+                            "version": "3.5",
+                            "raw_filename": "htop-3.5.raw",
+                            "fs_format": "squashfs",
+                            "sha256": "abc",
+                            "installed_at": _now().isoformat(),
+                            "snapshot_id": "s1",
+                            "provides": {},
+                        }
+                    },
+                    "user_requests": {},
+                    "snapshots": {},
+                }
+            )
+        )
+        state = load(path)
+        assert state.sysexts["htop-3.5"].pinned_date is None
+
+    def test_invalid_pinned_date_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sysexts": {
+                        "htop-3.5": {
+                            "name": "htop",
+                            "version": "3.5",
+                            "raw_filename": "htop-3.5.raw",
+                            "fs_format": "squashfs",
+                            "sha256": "abc",
+                            "installed_at": _now().isoformat(),
+                            "snapshot_id": "s1",
+                            "provides": {},
+                            "pinned_date": "not-a-date",
+                        }
+                    },
+                    "user_requests": {},
+                    "snapshots": {},
+                }
+            )
+        )
+        with pytest.raises(StateError, match="invalid pinned_date"):
+            load(path)
 
     def test_depends_must_be_list(self, tmp_path: Path) -> None:
         path = tmp_path / "state.db"

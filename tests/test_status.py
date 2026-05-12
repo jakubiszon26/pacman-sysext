@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -45,6 +45,7 @@ def _record(
     snapshot_id: str,
     depends: list[str] | None = None,
     sha: str = "x",
+    pinned_date: date | None = None,
 ) -> state.SysextRecord:
     return state.SysextRecord(
         name=name,
@@ -56,6 +57,7 @@ def _record(
         snapshot_id=snapshot_id,
         provides={},
         depends=depends or [],
+        pinned_date=pinned_date,
     )
 
 
@@ -306,6 +308,200 @@ def test_status_exits_cleanly_on_lock_timeout(
     captured = capsys.readouterr()
     assert "Error reading state" in captured.out
     assert "could not acquire lock" in captured.out
+
+
+def _time_sync_config(tmp_path: Path, pin: date | None) -> AppConfig:
+    base = tmp_path
+    return AppConfig(
+        pacman=PacmanConfig(
+            dbpath=base / "db",
+            cachedir=base / "cache",
+            config_file=base / "pacman.conf",
+            gpgdir=base / "gnupg",
+        ),
+        builder=BuilderConfig(output_dir=base / "sysexts"),
+        sysext=SysextConfig(extensions_dir=base / "extensions"),
+        state_db=base / "state.db",
+        time_sync=TimeSyncConfig(enabled=True, date=pin),
+    )
+
+
+def test_explicit_table_renders_pinned_column(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
+    raw_bytes = b"htop"
+    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
+
+    current = state.State()
+    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
+    state.add_sysext(
+        current,
+        _record(
+            "htop",
+            "3.5.1-1",
+            snapshot_id=snap_id,
+            sha=hashlib.sha256(raw_bytes).hexdigest(),
+            pinned_date=date(2025, 5, 1),
+        ),
+    )
+    state.add_user_request(
+        current,
+        state.UserRequest(
+            name="htop",
+            installed_version="3.5.1-1",
+            requested_at=_now(),
+            requirements={},
+        ),
+    )
+    state.save(current, config.state_db)
+
+    console = _capturing_console()
+    status_cmd.run(config, console=console)
+    out = console.export_text()
+    assert "Pinned" in out
+    assert "2025-05-01" in out
+
+
+def test_explicit_table_shows_dash_for_unpinned_records(tmp_path: Path) -> None:
+    """Records without pinned_date render `—` in the Pinned column."""
+    config = _config(tmp_path)
+    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
+    raw_bytes = b"htop"
+    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
+
+    current = state.State()
+    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
+    state.add_sysext(
+        current,
+        _record("htop", "3.5.1-1", snapshot_id=snap_id,
+                sha=hashlib.sha256(raw_bytes).hexdigest()),
+    )
+    state.add_user_request(
+        current,
+        state.UserRequest(
+            name="htop",
+            installed_version="3.5.1-1",
+            requested_at=_now(),
+            requirements={},
+        ),
+    )
+    state.save(current, config.state_db)
+
+    console = _capturing_console()
+    status_cmd.run(config, console=console)
+    out = console.export_text()
+    assert "—" in out
+
+
+def test_drift_hint_when_host_snapshot_advances(tmp_path: Path) -> None:
+    config = _time_sync_config(tmp_path, pin=date(2025, 5, 8))
+    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
+    raw_bytes = b"htop"
+    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
+
+    current = state.State()
+    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
+    state.add_sysext(
+        current,
+        _record(
+            "htop",
+            "3.5.1-1",
+            snapshot_id=snap_id,
+            sha=hashlib.sha256(raw_bytes).hexdigest(),
+            pinned_date=date(2025, 5, 1),
+        ),
+    )
+    state.add_user_request(
+        current,
+        state.UserRequest(
+            name="htop",
+            installed_version="3.5.1-1",
+            requested_at=_now(),
+            requirements={},
+        ),
+    )
+    state.save(current, config.state_db)
+
+    console = _capturing_console()
+    status_cmd.run(config, console=console)
+    out = console.export_text()
+    assert "pinned to 2025-05-01" in out
+    assert "host snapshot is now 2025-05-08" in out
+
+
+def test_no_drift_hint_when_dates_align(tmp_path: Path) -> None:
+    config = _time_sync_config(tmp_path, pin=date(2025, 5, 1))
+    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
+    raw_bytes = b"htop"
+    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
+
+    current = state.State()
+    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
+    state.add_sysext(
+        current,
+        _record(
+            "htop",
+            "3.5.1-1",
+            snapshot_id=snap_id,
+            sha=hashlib.sha256(raw_bytes).hexdigest(),
+            pinned_date=date(2025, 5, 1),
+        ),
+    )
+    state.add_user_request(
+        current,
+        state.UserRequest(
+            name="htop",
+            installed_version="3.5.1-1",
+            requested_at=_now(),
+            requirements={},
+        ),
+    )
+    state.save(current, config.state_db)
+
+    console = _capturing_console()
+    status_cmd.run(config, console=console)
+    out = console.export_text()
+    assert "Rebuild for ABI consistency" not in out
+
+
+def test_no_drift_hint_when_time_sync_disabled(tmp_path: Path) -> None:
+    """No drift hint when time-sync is disabled, even with pinned records present.
+
+    A record with pinned_date is a leftover from a prior time-sync install;
+    we don't know the current host snapshot date, so silence is correct.
+    """
+    config = _config(tmp_path)  # time_sync disabled by default
+    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
+    raw_bytes = b"htop"
+    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
+
+    current = state.State()
+    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
+    state.add_sysext(
+        current,
+        _record(
+            "htop",
+            "3.5.1-1",
+            snapshot_id=snap_id,
+            sha=hashlib.sha256(raw_bytes).hexdigest(),
+            pinned_date=date(2025, 5, 1),
+        ),
+    )
+    state.add_user_request(
+        current,
+        state.UserRequest(
+            name="htop",
+            installed_version="3.5.1-1",
+            requested_at=_now(),
+            requirements={},
+        ),
+    )
+    state.save(current, config.state_db)
+
+    console = _capturing_console()
+    status_cmd.run(config, console=console)
+    out = console.export_text()
+    assert "Rebuild for ABI consistency" not in out
 
 
 def test_status_renders_scan_error_when_output_dir_unreadable(tmp_path: Path) -> None:

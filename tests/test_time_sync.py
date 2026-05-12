@@ -341,16 +341,18 @@ class TestPrepareSandbox:
             probe=lambda url: True,
         )
 
+        assert result.effective_date == date(2025, 5, 1)
+        pacman = result.pacman
         namespace = "ala-2025-05-01"
-        assert result.dbpath == tmp_path / "db" / namespace
-        assert result.cachedir == tmp_path / "cache" / namespace
-        assert result.config_file == result.dbpath / ".pinned" / "pacman.conf"
+        assert pacman.dbpath == tmp_path / "db" / namespace
+        assert pacman.cachedir == tmp_path / "cache" / namespace
+        assert pacman.config_file == pacman.dbpath / ".pinned" / "pacman.conf"
 
         # Sync DBs copied (only *.db, not the rendered config).
-        assert (result.dbpath / "sync" / "core.db").exists()
-        assert (result.dbpath / "sync" / "extra.db").exists()
+        assert (pacman.dbpath / "sync" / "core.db").exists()
+        assert (pacman.dbpath / "sync" / "extra.db").exists()
 
-        rendered = result.config_file.read_text()
+        rendered = pacman.config_file.read_text()
         assert (
             "Server = https://archive.archlinux.org/repos/2025/05/01/core/os/x86_64" in rendered
         )
@@ -372,7 +374,8 @@ class TestPrepareSandbox:
             arch="x86_64",
             probe=lambda url: True,
         )
-        assert result.dbpath.name == "ala-2025-06-15"
+        assert result.effective_date == date(2025, 6, 15)
+        assert result.pacman.dbpath.name == "ala-2025-06-15"
 
     def test_files_dbs_are_not_copied(self, tmp_path: Path) -> None:
         epoch = int(datetime(2025, 5, 1, tzinfo=UTC).timestamp())
@@ -389,4 +392,4 @@ class TestPrepareSandbox:
             arch="x86_64",
             probe=lambda url: True,
         )
-        assert not (result.dbpath / "sync" / "core.files").exists()
+        assert not (result.pacman.dbpath / "sync" / "core.files").exists()

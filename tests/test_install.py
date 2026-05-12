@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1150,10 +1150,13 @@ class TestTimeSyncInstall:
             config_file=tmp_path / "sandbox" / "pacman.conf",
             gpgdir=tmp_path / "gnupg",
         )
+        from pacman_sysext.time_sync import PreparedSandbox
+
+        prepared = PreparedSandbox(pacman=sandbox_pacman, effective_date=date(2025, 5, 1))
         with (
             patch(
                 "pacman_sysext.commands.install.time_sync.prepare_sandbox",
-                return_value=sandbox_pacman,
+                return_value=prepared,
             ),
             pytest.raises(typer.Exit) as exc_info,
         ):
@@ -1197,6 +1200,9 @@ class TestTimeSyncInstall:
             config_file=tmp_path / "sandbox" / "pacman.conf",
             gpgdir=tmp_path / "gnupg",
         )
+        from pacman_sysext.time_sync import PreparedSandbox
+
+        prepared = PreparedSandbox(pacman=sandbox_pacman, effective_date=date(2025, 5, 1))
         self._seed_sandbox(
             sandbox_pacman.cachedir,
             ["glibc-2.39-1-x86_64.pkg.tar.zst", "htop-3.5.1-1-x86_64.pkg.tar.zst"],
@@ -1204,7 +1210,7 @@ class TestTimeSyncInstall:
 
         with patch(
             "pacman_sysext.commands.install.time_sync.prepare_sandbox",
-            return_value=sandbox_pacman,
+            return_value=prepared,
         ) as prep:
             install.run("htop", config)
 
@@ -1212,10 +1218,12 @@ class TestTimeSyncInstall:
         # download_package was called against the sandbox config, not the
         # base /var/lib/pacman-sysext cachedir.
         assert mocked["download_package"].call_args[0][1] is sandbox_pacman
-        # State landed.
+        # State landed and every record carries the pinned date.
         result = state.load(config.state_db)
         assert "htop" in result.user_requests
         assert {"glibc-2.39-1", "htop-3.5.1-1"} == set(result.sysexts.keys())
+        for record in result.sysexts.values():
+            assert record.pinned_date == date(2025, 5, 1)
 
     def test_prepare_sandbox_failure_surfaces_cleanly(
         self,

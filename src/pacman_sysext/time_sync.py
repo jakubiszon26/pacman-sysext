@@ -45,6 +45,14 @@ class TimeSyncError(Exception):
 
 
 @dataclass(frozen=True)
+class PreparedSandbox:
+    """Outcome of `prepare_sandbox`: resolver-facing PacmanConfig + the date pinned to it."""
+
+    pacman: PacmanConfig
+    effective_date: date
+
+
+@dataclass(frozen=True)
 class TimeSyncConfig:
     """Configuration for `[time_sync]` section.
 
@@ -229,13 +237,14 @@ def prepare_sandbox(
     host_pacman_conf: Path = Path("/etc/pacman.conf"),
     arch: str | None = None,
     probe: Callable[[str], bool] | None = None,
-) -> PacmanConfig:
-    """Build a date-pinned sandbox and return a `PacmanConfig` pointed at it.
+) -> PreparedSandbox:
+    """Build a date-pinned sandbox and return its `PacmanConfig` + effective date.
 
-    Returns a plain `PacmanConfig` (no subclass) so downstream code stays
-    backend-agnostic. The returned config's `dbpath` and `cachedir` are
-    namespaced by the *effective* snapshot date (post forward-search) so
-    two installs that resolve to the same date share their cache.
+    The returned config's `dbpath` and `cachedir` are namespaced by the
+    *effective* snapshot date (post forward-search), so two installs
+    that resolve to the same date share their cache. The date is
+    exposed alongside the config so state-layer code can persist
+    `pinned_date` without re-running the forward search.
     """
     if not time_sync_cfg.enabled:
         raise TimeSyncError(
@@ -278,12 +287,13 @@ def prepare_sandbox(
     )
     pinned_conf.write_text(rendered)
 
-    return replace(
+    pacman_cfg = replace(
         base_pacman_cfg,
         dbpath=sandbox_dbpath,
         cachedir=sandbox_cachedir,
         config_file=pinned_conf,
     )
+    return PreparedSandbox(pacman=pacman_cfg, effective_date=effective_date)
 
 
 def _copy_sync_dbs(host_sync_dir: Path, dest_dir: Path) -> None:
