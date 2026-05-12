@@ -668,6 +668,43 @@ class TestStatusHelpers:
         assert [r.name for r in report.missing_files] == ["htop"]
         assert report.unregistered_files == []
 
+    def test_audit_integrity_handles_unreadable_dir(self, tmp_path: Path) -> None:
+        sysexts = tmp_path / "sysexts"
+        sysexts.mkdir()
+        # Pre-create a file so the existence-based missing_files check still
+        # has something to report; the scan itself is what must fail safely.
+        (sysexts / "htop-1.raw").write_bytes(b"data")
+        state = State()
+        add_sysext(state, _make_sysext("htop", "1"))
+
+        os.chmod(sysexts, 0)
+        try:
+            report = audit_integrity(state, sysexts)
+        finally:
+            os.chmod(sysexts, 0o755)
+
+        assert report.scan_error is not None
+        assert str(sysexts) in report.scan_error
+        assert report.unregistered_files == []
+
+    def test_get_orphans_accepts_precomputed_sets(self) -> None:
+        state = State()
+        # Legacy record with depends=[] would normally trigger the resolver
+        # during get_implicit. Here we precompute implicit ourselves and
+        # assert get_orphans never asks for it again.
+        add_sysext(state, _make_sysext("htop", "1", depends=["ncurses"]))
+        add_sysext(state, _make_sysext("ncurses", "1", depends=[]))
+        add_sysext(state, _make_sysext("leftover", "9"))
+        add_user_request(state, _make_request("htop", "1", {"ncurses": ""}))
+
+        def poison(_name: str) -> list[str]:
+            raise AssertionError("dep_resolver must not run when implicit is precomputed")
+
+        explicit = get_explicit(state)
+        implicit = get_implicit(state)
+        orphans = get_orphans(state, dep_resolver=poison, explicit=explicit, implicit=implicit)
+        assert [r.name for r in orphans] == ["leftover"]
+
 
 class TestSysextDepends:
     def test_round_trip_with_depends(self, tmp_path: Path) -> None:

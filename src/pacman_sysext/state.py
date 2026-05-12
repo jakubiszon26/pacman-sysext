@@ -104,10 +104,17 @@ class AbiDrift:
 
 @dataclass(frozen=True)
 class IntegrityReport:
-    """Audit of state.db against the actual sysext output directory."""
+    """Audit of state.db against the actual sysext output directory.
+
+    `scan_error` is populated when the on-disk scan could not be completed
+    (e.g. the output directory exists but is unreadable). In that case
+    `unregistered_files` is empty and `missing_files` reflects only what
+    the existence checks could prove.
+    """
 
     missing_files: list[SysextRecord]
     unregistered_files: list[Path]
+    scan_error: str | None = None
 
 
 def sysext_key(name: str, version: str) -> str:
@@ -415,28 +422,60 @@ def get_implicit(
 def get_orphans(
     state: State,
     dep_resolver: Callable[[str], list[str]] | None = None,
+    *,
+    explicit: list[SysextRecord] | None = None,
+    implicit: list[SysextRecord] | None = None,
 ) -> list[SysextRecord]:
-    """SysextRecords not reachable as explicit or implicit — cleanup candidates."""
-    explicit = {sysext_key(r.name, r.version) for r in get_explicit(state)}
-    implicit = {sysext_key(r.name, r.version) for r in get_implicit(state, dep_resolver)}
+    """SysextRecords not reachable as explicit or implicit — cleanup candidates.
+
+    Callers that already computed `explicit` and `implicit` (e.g. status,
+    which needs to render them anyway) can pass them in to avoid a second
+    BFS through the dep graph. With both kwargs supplied, `dep_resolver`
+    is never consulted.
+    """
+    if explicit is None:
+        explicit = get_explicit(state)
+    if implicit is None:
+        implicit = get_implicit(state, dep_resolver)
+    explicit_keys = {sysext_key(r.name, r.version) for r in explicit}
+    implicit_keys = {sysext_key(r.name, r.version) for r in implicit}
     return [
         record
         for key, record in state.sysexts.items()
-        if key not in explicit and key not in implicit
+        if key not in explicit_keys and key not in implicit_keys
     ]
 
 
 def audit_integrity(state: State, sysexts_dir: Path) -> IntegrityReport:
-    """Reconcile state.sysexts with the actual contents of `sysexts_dir`."""
+    """Reconcile state.sysexts with the actual contents of `sysexts_dir`.
+
+    A missing `sysexts_dir` is normal (no installs yet) and reports every
+    record as missing. An unreadable directory (e.g. the user lacks +rx on
+    the system-wide output_dir) is an environmental error: we return what
+    state knows and surface `scan_error` so the caller can render it.
+    """
     registered = {r.raw_filename: r for r in state.sysexts.values()}
-    missing_files = [
-        r for r in state.sysexts.values() if not (sysexts_dir / r.raw_filename).exists()
-    ]
     if not sysexts_dir.exists():
-        return IntegrityReport(missing_files=missing_files, unregistered_files=[])
-    unregistered_files = [
-        path for path in sorted(sysexts_dir.glob("*.raw")) if path.name not in registered
-    ]
+        return IntegrityReport(
+            missing_files=list(state.sysexts.values()),
+            unregistered_files=[],
+        )
+    try:
+        missing_files = [
+            r for r in state.sysexts.values() if not (sysexts_dir / r.raw_filename).exists()
+        ]
+        on_disk = sorted(sysexts_dir.glob("*.raw"))
+    except OSError as e:
+        logger.warning("Could not scan sysext output dir %s: %s", sysexts_dir, e)
+        # Without working stat() we cannot prove which records are
+        # missing — return state's view conservatively and let scan_error
+        # tell the caller "this report is not authoritative".
+        return IntegrityReport(
+            missing_files=[],
+            unregistered_files=[],
+            scan_error=f"could not scan {sysexts_dir}: {e}",
+        )
+    unregistered_files = [path for path in on_disk if path.name not in registered]
     return IntegrityReport(missing_files=missing_files, unregistered_files=unregistered_files)
 
 
