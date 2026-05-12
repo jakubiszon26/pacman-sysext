@@ -192,9 +192,9 @@ class TestResolveRequiredPackages:
 
     def test_parses_multi_repo_lines(self, tmp_path: Path) -> None:
         out = (
-            "core\tglibc\t2.39-1\thttps://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
-            "extra\thtop\t3.5.1-1\thttps://mirror.example/extra/os/x86_64/htop-3.5.1-1-x86_64.pkg.tar.zst\n"
-            "multilib\tlib32-glibc\t2.39-1\thttps://mirror.example/multilib/os/x86_64/lib32-glibc-2.39-1-x86_64.pkg.tar.zst\n"
+            "core|glibc|2.39-1|https://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
+            "extra|htop|3.5.1-1|https://mirror.example/extra/os/x86_64/htop-3.5.1-1-x86_64.pkg.tar.zst\n"
+            "multilib|lib32-glibc|2.39-1|https://mirror.example/multilib/os/x86_64/lib32-glibc-2.39-1-x86_64.pkg.tar.zst\n"
         )
         with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)) as m:
             deps = resolve_required_packages("htop", _pacman_config(tmp_path))
@@ -225,14 +225,31 @@ class TestResolveRequiredPackages:
         called_args = m.call_args[0][0]
         assert "--print" in called_args
         assert "--print-format" in called_args
-        assert called_args[called_args.index("--print-format") + 1] == "%r\t%n\t%v\t%l"
+        assert called_args[called_args.index("--print-format") + 1] == "%r|%n|%v|%l"
         assert "--noconfirm" in called_args
 
+    def test_print_format_contains_no_whitespace(self, tmp_path: Path) -> None:
+        """Regression: some immutable distros ship pacman as a `$@`-wrapper
+        shell script that re-splits argv on IFS. A tab inside the format
+        string would be exploded into separate argv entries, leaving the
+        real pacman with bare `%n`/`%v`/`%l` as positional targets. The
+        chosen separator MUST stay outside the default IFS.
+        """
+        import string
+
+        out = "core|glibc|2.39-1|https://mirror.example/glibc.pkg.tar.zst\n"
+        with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)) as m:
+            resolve_required_packages("glibc", _pacman_config(tmp_path))
+        fmt = m.call_args[0][0][m.call_args[0][0].index("--print-format") + 1]
+        assert not any(c in fmt for c in string.whitespace), (
+            f"--print-format must not contain whitespace, got {fmt!r}"
+        )
+
     def test_url_with_embedded_spaces_passes_through(self, tmp_path: Path) -> None:
-        # Defensive: tab-separated splitting must preserve any whitespace
+        # Defensive: field splitting on `|` must preserve any whitespace
         # inside fields. Pacman shouldn't emit literal spaces in URLs, but
         # the parser must not split on them either way.
-        out = "core\tfoo\t1.0-1\tfile:///cache with spaces/foo-1.0-1-x86_64.pkg.tar.zst\n"
+        out = "core|foo|1.0-1|file:///cache with spaces/foo-1.0-1-x86_64.pkg.tar.zst\n"
         with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)):
             deps = resolve_required_packages("foo", _pacman_config(tmp_path))
         assert deps == [
@@ -248,7 +265,7 @@ class TestResolveRequiredPackages:
     def test_blank_lines_skipped(self, tmp_path: Path) -> None:
         out = (
             "\n"
-            "core\tglibc\t2.39-1\thttps://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
+            "core|glibc|2.39-1|https://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
             "\n"
         )
         with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)):
@@ -257,7 +274,7 @@ class TestResolveRequiredPackages:
         assert deps[0].name == "glibc"
 
     def test_malformed_line_raises(self, tmp_path: Path) -> None:
-        out = "core glibc 2.39-1 url\n"  # spaces instead of tabs
+        out = "core glibc 2.39-1 url\n"  # missing `|` separators
         with (
             patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)),
             pytest.raises(PacmanError, match="unexpected --print-format"),
@@ -266,8 +283,8 @@ class TestResolveRequiredPackages:
 
     def test_get_required_packages_wraps_resolver(self, tmp_path: Path) -> None:
         out = (
-            "core\tglibc\t2.39-1\thttps://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
-            "extra\thtop\t3.5.1-1\thttps://mirror.example/extra/os/x86_64/htop-3.5.1-1-x86_64.pkg.tar.zst\n"
+            "core|glibc|2.39-1|https://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
+            "extra|htop|3.5.1-1|https://mirror.example/extra/os/x86_64/htop-3.5.1-1-x86_64.pkg.tar.zst\n"
         )
         with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)):
             filenames = get_required_packages("htop", _pacman_config(tmp_path))

@@ -157,17 +157,28 @@ class ResolvedDep:
     filename: str
 
 
+_RESOLVE_FIELD_SEP = "|"
+_RESOLVE_PRINT_FORMAT = f"%r{_RESOLVE_FIELD_SEP}%n{_RESOLVE_FIELD_SEP}%v{_RESOLVE_FIELD_SEP}%l"
+
+
 def resolve_required_packages(package: str, config: PacmanConfig) -> list[ResolvedDep]:
     """Return structured resolution of every package pacman would fetch for `package`.
 
-    Backed by `pacman -Sw <pkg> --print --print-format "%r\\t%n\\t%v\\t%l"`.
-    The repo source (`%r`) is the authoritative classification — far
-    cheaper than N follow-up `pacman -Si` probes and semantically
-    correct for time-sync repo policy gating.
+    Backed by `pacman -Sw <pkg> --print --print-format "%r|%n|%v|%l"`. The
+    repo source (`%r`) is the authoritative classification — far cheaper
+    than N follow-up `pacman -Si` probes and semantically correct for
+    time-sync repo policy gating.
+
+    The field separator is `|` rather than `\\t` because some immutable
+    distros (Arkane, Garuda-immutable, …) ship `/usr/bin/pacman` as a
+    shell wrapper that re-tokenizes argv via unquoted `$@`. With a tab
+    inside the format string the wrapper would split it on IFS and the
+    real pacman would see `%n`/`%v`/`%l` as positional targets and fail
+    with `target not found: %n`. `|` is not in default IFS and never
+    appears inside the four fields, so it survives the wrapper intact.
     """
-    fmt = "%r\t%n\t%v\t%l"
     result = _run_pacman(
-        ["-Sw", package, "--print", "--print-format", fmt, "--noconfirm"],
+        ["-Sw", package, "--print", "--print-format", _RESOLVE_PRINT_FORMAT, "--noconfirm"],
         config,
     )
 
@@ -176,9 +187,7 @@ def resolve_required_packages(package: str, config: PacmanConfig) -> list[Resolv
         line = raw_line.rstrip("\r")
         if not line.strip():
             continue
-        # Split on tab so embedded spaces in any field (notably the URL)
-        # pass through unmangled.
-        parts = line.split("\t")
+        parts = line.split(_RESOLVE_FIELD_SEP)
         if len(parts) != 4:
             raise PacmanError(
                 f"unexpected --print-format output line: {line!r}",
