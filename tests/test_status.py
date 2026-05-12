@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import typer
 from rich.console import Console
 
 from pacman_sysext import state
@@ -212,10 +214,10 @@ def test_dashboard_uses_fallback_resolver_for_legacy_records(
 
     status_cmd.run(config, console=_capturing_console())
 
-    # ncurses (legacy) triggers the fallback exactly once — and only ncurses.
-    # The walk is invoked twice (get_implicit and get_orphans both run it),
-    # which is acceptable as long as legacy nodes are the only callers.
-    assert set(calls) == {"ncurses"}
+    # ncurses (legacy) triggers the fallback exactly once: status computes
+    # implicit once and reuses it for get_orphans, so the BFS — and the
+    # resolver invocation for any legacy node it encounters — runs once.
+    assert calls == ["ncurses"]
 
 
 def test_pacman_failure_does_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,3 +261,82 @@ def test_pacman_failure_does_not_crash(tmp_path: Path, monkeypatch: pytest.Monke
 
     # Must not raise — status degrades silently when pacman is unavailable.
     status_cmd.run(config, console=_capturing_console())
+
+
+def test_status_exits_cleanly_on_malformed_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _config(tmp_path)
+    config.state_db.parent.mkdir(parents=True, exist_ok=True)
+    config.state_db.write_text("{not valid json")
+
+    with pytest.raises(typer.Exit) as exc_info:
+        status_cmd.run(config, console=_capturing_console())
+    assert exc_info.value.exit_code == 1
+
+    captured = capsys.readouterr()
+    assert "Error reading state" in captured.out
+
+
+def test_status_exits_cleanly_on_lock_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _config(tmp_path)
+
+    # Mock `state.locked` to raise the same StateError that a real timeout
+    # would. Driving the actual filesystem lock to time out requires either
+    # waiting out _DEFAULT_LOCK_TIMEOUT (300s) or patching the default arg —
+    # default args are bound at function-definition time, so reassigning the
+    # module constant is a no-op. Mocking the entry point is cleaner.
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_locked(_path: Path, timeout: float | None = None) -> object:
+        raise state.StateError("could not acquire lock on /fake/lock within 0s")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("pacman_sysext.commands.status.state.locked", fake_locked)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        status_cmd.run(config, console=_capturing_console())
+    assert exc_info.value.exit_code == 1
+
+    captured = capsys.readouterr()
+    assert "Error reading state" in captured.out
+    assert "could not acquire lock" in captured.out
+
+
+def test_status_renders_scan_error_when_output_dir_unreadable(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
+    (config.builder.output_dir / "htop-1.raw").write_bytes(b"data")
+
+    current = state.State()
+    state.intern_snapshot(current, {})
+    state.add_sysext(
+        current,
+        state.SysextRecord(
+            name="htop",
+            version="1",
+            raw_filename="htop-1.raw",
+            fs_format="squashfs",
+            sha256="x",
+            installed_at=_now(),
+            snapshot_id="dangling",
+            provides={},
+            depends=[],
+        ),
+    )
+    state.save(current, config.state_db)
+
+    console = _capturing_console()
+    os.chmod(config.builder.output_dir, 0)
+    try:
+        status_cmd.run(config, console=console)
+    finally:
+        os.chmod(config.builder.output_dir, 0o755)
+
+    out = console.export_text()
+    assert "Integrity issues" in out
+    assert "Output directory scan failed" in out
+    assert "could not scan" in out

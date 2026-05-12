@@ -6,6 +6,7 @@ import logging
 from collections.abc import Iterable
 from pathlib import Path
 
+import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -30,13 +31,10 @@ def run(config: AppConfig, console: Console | None = None) -> None:
     """
     console = console or Console()
 
-    with state.locked(config.state_db):
-        current_state = state.load(config.state_db)
-
-    # Resolver is invoked only by get_implicit/get_orphans when a record has
-    # depends=[] — i.e. a legacy entry or a true leaf. Records persisted by
-    # the current install command always carry their direct deps in state,
-    # so this fallback is rarely exercised on fresh systems.
+    # Resolver is invoked only by get_implicit when a record has depends=[]
+    # — i.e. a legacy entry or a true leaf. Records persisted by the current
+    # install command always carry their direct deps in state, so this
+    # fallback is rarely exercised on fresh systems.
     def _fallback_resolver(name: str) -> list[str]:
         try:
             return [c.name for c in get_package_dependencies(name, config.pacman)]
@@ -44,12 +42,20 @@ def run(config: AppConfig, console: Console | None = None) -> None:
             logger.warning("pacman -Si %s failed; treating as no deps: %s", name, e)
             return []
 
-    report = state.audit_integrity(current_state, config.builder.output_dir)
-    explicit = state.get_explicit(current_state)
-    implicit = state.get_implicit(current_state, dep_resolver=_fallback_resolver)
-    orphans = state.get_orphans(current_state, dep_resolver=_fallback_resolver)
-
-    sizes = _collect_sizes(current_state.sysexts.values(), config.builder.output_dir)
+    try:
+        # Hold the lock across the on-disk audit so a concurrent install
+        # cannot mid-build expose a partial .raw to glob() / stat(). Pure
+        # rendering happens after the lock is dropped.
+        with state.locked(config.state_db):
+            current_state = state.load(config.state_db)
+            report = state.audit_integrity(current_state, config.builder.output_dir)
+            explicit = state.get_explicit(current_state)
+            implicit = state.get_implicit(current_state, dep_resolver=_fallback_resolver)
+            orphans = state.get_orphans(current_state, explicit=explicit, implicit=implicit)
+            sizes = _collect_sizes(current_state.sysexts.values(), config.builder.output_dir)
+    except state.StateError as e:
+        print(f"Error reading state: {e}")
+        raise typer.Exit(code=1) from e
 
     _render(
         console,
@@ -83,7 +89,7 @@ def _render(
     orphans: list[SysextRecord],
     sizes: dict[str, int],
 ) -> None:
-    has_audit_issues = bool(report.missing_files or report.unregistered_files)
+    has_audit_issues = bool(report.missing_files or report.unregistered_files or report.scan_error)
     if has_audit_issues:
         console.print(_audit_panel(report))
 
@@ -97,12 +103,17 @@ def _render(
 
 def _audit_panel(report: IntegrityReport) -> Panel:
     body = Text()
+    if report.scan_error:
+        body.append("Output directory scan failed:\n", style="bold")
+        body.append(f"  {report.scan_error}\n")
     if report.missing_files:
+        if report.scan_error:
+            body.append("\n")
         body.append("Recorded in state, missing on disk:\n", style="bold")
         for record in report.missing_files:
             body.append(f"  - {record.raw_filename}\n")
     if report.unregistered_files:
-        if report.missing_files:
+        if report.missing_files or report.scan_error:
             body.append("\n")
         body.append("Present on disk, unknown to state:\n", style="bold")
         for path in report.unregistered_files:
