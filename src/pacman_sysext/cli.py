@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 
 from pacman_sysext.commands import install as install_cmd
+from pacman_sysext.commands import status as status_cmd
 from pacman_sysext.config import AppConfig
 
 app = typer.Typer(
@@ -44,6 +45,12 @@ def install(
 def remove(package: str) -> None:
     """Remove sysext."""
     raise NotImplementedError("`remove` is not implemented yet")
+
+
+@app.command(name="status")
+def status(ctx: typer.Context) -> None:
+    """Audit installed sysexts and render a dashboard."""
+    status_cmd.run(ctx.obj)
 
 
 @app.command(name="list")

@@ -21,6 +21,7 @@ classifiers = [
     "Topic :: System :: Software Distribution",
 ]
 dependencies = [
+    "rich>=13",
     "typer>=0.25.1",
 ]
 
