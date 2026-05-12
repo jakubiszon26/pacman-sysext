@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from pacman_sysext.config import PacmanConfig
@@ -140,18 +141,67 @@ def parse_pkg_filename(pkg_file: Path | str) -> tuple[str, str]:
     return match["name"], f"{match['version']}-{match['release']}"
 
 
+@dataclass(frozen=True)
+class ResolvedDep:
+    """One package pacman would fetch for an install transaction.
+
+    `repo` is the source pacman db (`core`, `extra`, `multilib`,
+    `cachyos-v4`, …) as printed by `%r`. `url` is the full download
+    location pacman would use; `filename` is its basename.
+    """
+
+    repo: str
+    name: str
+    version: str
+    url: str
+    filename: str
+
+
+def resolve_required_packages(package: str, config: PacmanConfig) -> list[ResolvedDep]:
+    """Return structured resolution of every package pacman would fetch for `package`.
+
+    Backed by `pacman -Sw <pkg> --print --print-format "%r\\t%n\\t%v\\t%l"`.
+    The repo source (`%r`) is the authoritative classification — far
+    cheaper than N follow-up `pacman -Si` probes and semantically
+    correct for time-sync repo policy gating.
+    """
+    fmt = "%r\t%n\t%v\t%l"
+    result = _run_pacman(
+        ["-Sw", package, "--print", "--print-format", fmt, "--noconfirm"],
+        config,
+    )
+
+    resolved: list[ResolvedDep] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.rstrip("\r")
+        if not line.strip():
+            continue
+        # Split on tab so embedded spaces in any field (notably the URL)
+        # pass through unmangled.
+        parts = line.split("\t")
+        if len(parts) != 4:
+            raise PacmanError(
+                f"unexpected --print-format output line: {line!r}",
+                returncode=0,
+                stderr="",
+                stdout=result.stdout,
+            )
+        repo, name, version, url = parts
+        resolved.append(
+            ResolvedDep(
+                repo=repo,
+                name=name,
+                version=version,
+                url=url,
+                filename=Path(url).name,
+            )
+        )
+    return resolved
+
+
 def get_required_packages(package: str, config: PacmanConfig) -> list[str]:
     """Return filenames of all packages pacman would fetch for `package`."""
-    result = _run_pacman(["-Sw", package, "--print", "--noconfirm"], config)
-
-    filenames = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        filenames.append(Path(line).name)
-
-    return filenames
+    return [d.filename for d in resolve_required_packages(package, config)]
 
 
 def get_package_info(package: str, config: PacmanConfig) -> dict[str, str]:

@@ -8,12 +8,15 @@ from pacman_sysext.config import PacmanConfig
 from pacman_sysext.pacman import (
     ABI_RELEVANT_PACKAGES,
     PacmanError,
+    ResolvedDep,
     _parse_pacman_info,
     get_base_snapshot,
     get_package_dependencies,
     get_package_provides,
     get_package_version,
+    get_required_packages,
     parse_pkg_filename,
+    resolve_required_packages,
 )
 from pacman_sysext.version import VersionConstraint
 
@@ -180,3 +183,95 @@ class TestGetPackageProvides:
         result = subprocess.CompletedProcess(args=[], returncode=0, stdout=out, stderr="")
         with patch("pacman_sysext.pacman._run_pacman", return_value=result):
             assert get_package_provides("foo", _pacman_config(tmp_path)) == {}
+
+
+class TestResolveRequiredPackages:
+    @staticmethod
+    def _fake(stdout: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
+    def test_parses_multi_repo_lines(self, tmp_path: Path) -> None:
+        out = (
+            "core\tglibc\t2.39-1\thttps://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
+            "extra\thtop\t3.5.1-1\thttps://mirror.example/extra/os/x86_64/htop-3.5.1-1-x86_64.pkg.tar.zst\n"
+            "multilib\tlib32-glibc\t2.39-1\thttps://mirror.example/multilib/os/x86_64/lib32-glibc-2.39-1-x86_64.pkg.tar.zst\n"
+        )
+        with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)) as m:
+            deps = resolve_required_packages("htop", _pacman_config(tmp_path))
+        assert deps == [
+            ResolvedDep(
+                repo="core",
+                name="glibc",
+                version="2.39-1",
+                url="https://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst",
+                filename="glibc-2.39-1-x86_64.pkg.tar.zst",
+            ),
+            ResolvedDep(
+                repo="extra",
+                name="htop",
+                version="3.5.1-1",
+                url="https://mirror.example/extra/os/x86_64/htop-3.5.1-1-x86_64.pkg.tar.zst",
+                filename="htop-3.5.1-1-x86_64.pkg.tar.zst",
+            ),
+            ResolvedDep(
+                repo="multilib",
+                name="lib32-glibc",
+                version="2.39-1",
+                url="https://mirror.example/multilib/os/x86_64/lib32-glibc-2.39-1-x86_64.pkg.tar.zst",
+                filename="lib32-glibc-2.39-1-x86_64.pkg.tar.zst",
+            ),
+        ]
+        # Sanity: pacman is invoked with the structured print-format and --noconfirm.
+        called_args = m.call_args[0][0]
+        assert "--print" in called_args
+        assert "--print-format" in called_args
+        assert called_args[called_args.index("--print-format") + 1] == "%r\t%n\t%v\t%l"
+        assert "--noconfirm" in called_args
+
+    def test_url_with_embedded_spaces_passes_through(self, tmp_path: Path) -> None:
+        # Defensive: tab-separated splitting must preserve any whitespace
+        # inside fields. Pacman shouldn't emit literal spaces in URLs, but
+        # the parser must not split on them either way.
+        out = "core\tfoo\t1.0-1\tfile:///cache with spaces/foo-1.0-1-x86_64.pkg.tar.zst\n"
+        with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)):
+            deps = resolve_required_packages("foo", _pacman_config(tmp_path))
+        assert deps == [
+            ResolvedDep(
+                repo="core",
+                name="foo",
+                version="1.0-1",
+                url="file:///cache with spaces/foo-1.0-1-x86_64.pkg.tar.zst",
+                filename="foo-1.0-1-x86_64.pkg.tar.zst",
+            ),
+        ]
+
+    def test_blank_lines_skipped(self, tmp_path: Path) -> None:
+        out = (
+            "\n"
+            "core\tglibc\t2.39-1\thttps://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
+            "\n"
+        )
+        with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)):
+            deps = resolve_required_packages("glibc", _pacman_config(tmp_path))
+        assert len(deps) == 1
+        assert deps[0].name == "glibc"
+
+    def test_malformed_line_raises(self, tmp_path: Path) -> None:
+        out = "core glibc 2.39-1 url\n"  # spaces instead of tabs
+        with (
+            patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)),
+            pytest.raises(PacmanError, match="unexpected --print-format"),
+        ):
+            resolve_required_packages("glibc", _pacman_config(tmp_path))
+
+    def test_get_required_packages_wraps_resolver(self, tmp_path: Path) -> None:
+        out = (
+            "core\tglibc\t2.39-1\thttps://mirror.example/core/os/x86_64/glibc-2.39-1-x86_64.pkg.tar.zst\n"
+            "extra\thtop\t3.5.1-1\thttps://mirror.example/extra/os/x86_64/htop-3.5.1-1-x86_64.pkg.tar.zst\n"
+        )
+        with patch("pacman_sysext.pacman._run_pacman", return_value=self._fake(out)):
+            filenames = get_required_packages("htop", _pacman_config(tmp_path))
+        assert filenames == [
+            "glibc-2.39-1-x86_64.pkg.tar.zst",
+            "htop-3.5.1-1-x86_64.pkg.tar.zst",
+        ]
