@@ -59,7 +59,9 @@ def run(config: AppConfig, console: Console | None = None) -> None:
         print(f"Error reading state: {e}")
         raise typer.Exit(code=1) from e
 
-    host_snapshot_date = _maybe_host_snapshot_date(config)
+    host_snapshot_date = _maybe_host_snapshot_date(
+        [*explicit, *implicit, *orphans]
+    )
     _render(
         console,
         report=report,
@@ -71,20 +73,22 @@ def run(config: AppConfig, console: Console | None = None) -> None:
     )
 
 
-def _maybe_host_snapshot_date(config: AppConfig) -> date | None:
-    """Best-effort host snapshot date for drift detection.
+_HOST_SYNC_DIR = Path("/var/lib/pacman/sync")
 
-    Only fired when time-sync is enabled — otherwise pinning is opt-in
-    per install and a global drift hint is noise. Returns None on any
-    backend hiccup (missing DB, malformed entries) so status stays
-    renderable on hosts that haven't opted in to time-sync.
+
+def _maybe_host_snapshot_date(records: list[SysextRecord]) -> date | None:
+    """Best-effort *observed* host snapshot date for drift detection.
+
+    Fires whenever any record carries a `pinned_date` — that signal is
+    record-driven (an `--time-sync-date` one-shot install leaves a pinned
+    record even when config returns to disabled), so we recompute the
+    live host DB age every time the state would benefit from a comparison.
+    Returns None on any backend hiccup so status stays renderable.
     """
-    if not config.time_sync.enabled:
+    if not any(r.pinned_date is not None for r in records):
         return None
-    if config.time_sync.date is not None:
-        return config.time_sync.date
     try:
-        return time_sync.derive_snapshot_date(Path("/var/lib/pacman/sync"))
+        return time_sync.derive_snapshot_date(_HOST_SYNC_DIR)
     except TimeSyncError as e:
         logger.info("could not derive host snapshot date for drift hint: %s", e)
         return None

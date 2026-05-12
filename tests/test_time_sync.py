@@ -300,6 +300,75 @@ class TestRenderPinnedPacmanConf:
         assert "SigLevel = Never" not in out
         assert "Architecture = auto" in out
 
+    @pytest.mark.parametrize(
+        "weakening_line",
+        [
+            "SigLevel = Never",
+            "SigLevel = PackageNever",
+            "SigLevel = Optional TrustAll",
+            "SigLevel = PackageOptional DatabaseRequired",
+            "SigLevel = Required TrustAll",
+        ],
+    )
+    def test_strips_weakening_siglevel_in_mapped_repo_section(
+        self, weakening_line: str
+    ) -> None:
+        """Any weakening SigLevel inside a mapped [repo] is also dropped.
+
+        The pinned config routes mapped repos through the snapshot
+        backend; we refuse to inherit a relaxed trust policy alongside
+        the pin.
+        """
+        conf = (
+            "[core]\n"
+            f"{weakening_line}\n"
+            "Include = /etc/pacman.d/mirrorlist\n"
+        )
+        out = render_pinned_pacman_conf(
+            conf,
+            date(2025, 5, 1),
+            default_ala_servers(),
+            arch="x86_64",
+        )
+        assert weakening_line not in out
+        # Server replacement still landed.
+        assert "Server = https://archive.archlinux.org/" in out
+
+    def test_keeps_default_database_optional(self) -> None:
+        """`DatabaseOptional` is pacman's compiled-in default — preserve it."""
+        conf = (
+            "[core]\n"
+            "SigLevel = Required DatabaseOptional\n"
+            "Include = /etc/pacman.d/mirrorlist\n"
+        )
+        out = render_pinned_pacman_conf(
+            conf,
+            date(2025, 5, 1),
+            default_ala_servers(),
+            arch="x86_64",
+        )
+        assert "SigLevel = Required DatabaseOptional" in out
+
+    def test_unmapped_repo_keeps_its_weak_siglevel(self) -> None:
+        """We only sanitize sections we redirect — strict policy handles the rest."""
+        conf = (
+            "[core]\n"
+            "Include = /etc/pacman.d/mirrorlist\n"
+            "\n"
+            "[shady-repo]\n"
+            "SigLevel = Never\n"
+            "Server = https://shady.example/repo\n"
+        )
+        out = render_pinned_pacman_conf(
+            conf,
+            date(2025, 5, 1),
+            {"core": "https://archive.archlinux.org/repos/{date}/{repo}/os/{arch}"},
+            arch="x86_64",
+        )
+        # Untouched — the strict policy gate will block any dep from this
+        # repo downstream; the SigLevel here never gets exercised.
+        assert "SigLevel = Never" in out
+
 
 class TestPrepareSandbox:
     def _base_config(self, tmp_path: Path) -> PacmanConfig:
@@ -376,6 +445,65 @@ class TestPrepareSandbox:
         )
         assert result.effective_date == date(2025, 6, 15)
         assert result.pacman.dbpath.name == "ala-2025-06-15"
+
+    def test_removes_stale_sandbox_dbs_before_copy(self, tmp_path: Path) -> None:
+        """A repo dropped from the host must not linger in the sandbox.
+
+        Reusing `ala-<date>/sync/` would otherwise let the resolver see a
+        repo the host no longer has — violating the 'DB is the host
+        worldview' invariant.
+        """
+        epoch = int(datetime(2025, 5, 1, tzinfo=UTC).timestamp())
+        host_sync, host_conf = self._populate_host(tmp_path, epoch)
+        cfg = TimeSyncConfig(enabled=True, snapshot_servers=default_ala_servers())
+
+        # First prepare with an extra repo present on host.
+        _make_sync_db(host_sync / "removed.db", [("removed", "1", epoch)])
+        result1 = prepare_sandbox(
+            cfg,
+            self._base_config(tmp_path),
+            host_sync_dir=host_sync,
+            host_pacman_conf=host_conf,
+            arch="x86_64",
+            probe=lambda url: True,
+        )
+        assert (result1.pacman.dbpath / "sync" / "removed.db").exists()
+
+        # Host drops the repo; re-prepare with the same effective date.
+        (host_sync / "removed.db").unlink()
+        result2 = prepare_sandbox(
+            cfg,
+            self._base_config(tmp_path),
+            host_sync_dir=host_sync,
+            host_pacman_conf=host_conf,
+            arch="x86_64",
+            probe=lambda url: True,
+        )
+        # Same namespace dir, but the stale DB is gone.
+        assert result1.pacman.dbpath == result2.pacman.dbpath
+        assert not (result2.pacman.dbpath / "sync" / "removed.db").exists()
+
+    def test_symlinked_sync_db_is_refused(self, tmp_path: Path) -> None:
+        epoch = int(datetime(2025, 5, 1, tzinfo=UTC).timestamp())
+        host_sync, host_conf = self._populate_host(tmp_path, epoch)
+        # Replace extra.db with a symlink pointing somewhere unrelated.
+        attacker_payload = tmp_path / "elsewhere.db"
+        attacker_payload.write_bytes(b"not a real DB")
+        (host_sync / "extra.db").unlink()
+        (host_sync / "extra.db").symlink_to(attacker_payload)
+
+        cfg = TimeSyncConfig(enabled=True, snapshot_servers=default_ala_servers())
+        result = prepare_sandbox(
+            cfg,
+            self._base_config(tmp_path),
+            host_sync_dir=host_sync,
+            host_pacman_conf=host_conf,
+            arch="x86_64",
+            probe=lambda url: True,
+        )
+        # core.db copies fine; the symlinked extra.db is skipped entirely.
+        assert (result.pacman.dbpath / "sync" / "core.db").exists()
+        assert not (result.pacman.dbpath / "sync" / "extra.db").exists()
 
     def test_files_dbs_are_not_copied(self, tmp_path: Path) -> None:
         epoch = int(datetime(2025, 5, 1, tzinfo=UTC).timestamp())

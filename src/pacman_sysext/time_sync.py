@@ -19,6 +19,7 @@ import re
 import shutil
 import tarfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -36,6 +37,23 @@ _MAX_FORWARD_SEARCH_DAYS = 7
 _PROBE_TIMEOUT_S = 5.0
 _SECTION_RE = re.compile(r"^\[(.+?)\]\s*$")
 _KEY_RE = re.compile(r"^\s*([A-Za-z]\w*)\s*=")
+
+# Tokens that weaken pacman signature verification. Bare `Never`/`Optional`
+# affect both packages and DBs; `Package*` variants weaken package sigs
+# specifically (the resolver fetches packages, so this matters). `TrustAll`
+# accepts signatures from unknown keys — equivalent to no verification
+# for any key the host doesn't already trust. `DatabaseOptional` is
+# pacman's compiled-in default and is intentionally NOT flagged.
+_WEAKENING_SIGLEVEL_TOKENS = frozenset(
+    {
+        "never",
+        "packagenever",
+        "databasenever",
+        "optional",
+        "packageoptional",
+        "trustall",
+    }
+)
 
 Policy = Literal["strict"]
 
@@ -57,8 +75,10 @@ class TimeSyncConfig:
     """Configuration for `[time_sync]` section.
 
     `snapshot_servers` maps repo name → URL template. Recognised
-    placeholders: `{date}` (YYYY/MM/DD UTC), `{repo}`, `{arch}`. Repos
-    absent from the map are *not* pinned and will be caught by the
+    placeholders: `{date}` (YYYY/MM/DD UTC), `{repo}`, `{arch}`. Defaults
+    to an empty map — vendors opt in via `config.toml`, and `--time-sync-date`
+    on a stock Arch host falls back to `default_ala_servers()` at the
+    CLI layer. Repos absent from the resolved map are caught by the
     strict policy gate downstream.
     """
 
@@ -217,8 +237,12 @@ def render_pinned_pacman_conf(
                     server_written = True
                 continue
 
-        if current_section == "options" and _is_weakening_siglevel(raw_line):
-            logger.info("dropping weakening SigLevel override from pinned pacman.conf")
+        if (current_section == "options" or mapped_section) and _is_weakening_siglevel(raw_line):
+            logger.info(
+                "dropping weakening SigLevel override from pinned pacman.conf "
+                "(section %r)",
+                current_section,
+            )
             continue
 
         out_lines.append(raw_line)
@@ -297,14 +321,29 @@ def prepare_sandbox(
 
 
 def _copy_sync_dbs(host_sync_dir: Path, dest_dir: Path) -> None:
-    """Copy only `*.db` from host sync dir. `.files` DBs are unused by the resolver."""
+    """Copy only regular `*.db` files from host sync dir.
+
+    `.files` DBs are unused by the resolver and skipped. Pre-existing
+    `*.db` in `dest_dir` are removed first so a repo dropped from the
+    host doesn't linger in the sandbox and silently widen the resolver's
+    worldview. Symlinks are refused — a sync DB pointing at unexpected
+    bytes would corrupt the snapshot invariant.
+    """
     if not host_sync_dir.is_dir():
         raise TimeSyncError(f"host sync dir missing: {host_sync_dir}")
+    for stale in dest_dir.glob("*.db"):
+        try:
+            stale.unlink()
+        except OSError as e:
+            raise TimeSyncError(f"cannot clear stale sync DB {stale}: {e}") from e
     copied = 0
     for db_file in sorted(host_sync_dir.glob("*.db")):
+        if db_file.is_symlink() or not db_file.is_file():
+            logger.warning("refusing non-regular sync DB %s; skipping", db_file)
+            continue
         target = dest_dir / db_file.name
         try:
-            shutil.copy2(db_file, target)
+            shutil.copy2(db_file, target, follow_symlinks=False)
             # fsync — pacman never re-reads a DB it didn't write, so a
             # crash mid-copy leaving a torn file would silently break the
             # next install. Cheap on the ~MB-sized syncs.
@@ -314,7 +353,7 @@ def _copy_sync_dbs(host_sync_dir: Path, dest_dir: Path) -> None:
             raise TimeSyncError(f"cannot copy sync DB {db_file} -> {target}: {e}") from e
         copied += 1
     if copied == 0:
-        raise TimeSyncError(f"no *.db files in {host_sync_dir}")
+        raise TimeSyncError(f"no regular *.db files in {host_sync_dir}")
 
 
 def _max_builddate_from_db(db_path: Path) -> date:
@@ -359,24 +398,63 @@ def _extract_builddate(desc: str) -> int | None:
 
 
 def _is_weakening_siglevel(raw_line: str) -> bool:
-    """`SigLevel = ... Never ...` overrides skip signature verification."""
+    """True if `SigLevel = ...` contains any token that weakens verification.
+
+    Applied to `[options]` and every mapped repo section in the pinned
+    config — those sections route through the snapshot backend, so we
+    refuse to inherit a relaxed trust policy from the host.
+    """
     if "=" not in raw_line:
         return False
     key, value = raw_line.split("=", 1)
     if key.strip() != "SigLevel":
         return False
     tokens = value.split()
-    return any(tok.lower() == "never" for tok in tokens)
+    return any(tok.lower() in _WEAKENING_SIGLEVEL_TOKENS for tok in tokens)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Treat any 3xx as 'not present at this URL' instead of following.
+
+    A redirect on a snapshot URL almost always means the date is missing
+    and the server is bouncing to /latest/ — semantically the snapshot
+    *isn't there*. Following the redirect would also widen the attack
+    surface to any host the configured template happens to redirect to
+    (SSRF-style probing of internal endpoints).
+    """
+
+    def http_error_302(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+    ) -> object:
+        raise urllib.error.HTTPError(req.get_full_url(), code, msg, headers, fp)  # type: ignore[arg-type]
+
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
 
 
 def _http_probe(url: str) -> bool:
-    """HEAD-style availability check. True on 2xx/3xx, False otherwise."""
+    """HEAD availability check. True only on 2xx; redirects and errors are False.
+
+    Restricted to http/https — file://, ftp:// and friends cannot be
+    snapshot backends and a typo'd template should not exfiltrate to
+    a non-HTTP endpoint via urllib's generic openers.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    opener = urllib.request.build_opener(_NoRedirectHandler)
     req = urllib.request.Request(url, method="HEAD")
     try:
-        with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
-            status = int(resp.status)
-            return 200 <= status < 400
-    except urllib.error.HTTPError as e:
-        return 200 <= int(e.code) < 400
+        with opener.open(req, timeout=_PROBE_TIMEOUT_S) as resp:
+            return 200 <= int(resp.status) < 300
+    except urllib.error.HTTPError:
+        return False
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
