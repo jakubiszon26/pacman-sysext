@@ -1,9 +1,11 @@
 """Build systemd-sysext images from pacman packages."""
 
 import logging
+import os
 import platform
 import posixpath
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator
@@ -35,10 +37,18 @@ _ARCH_METADATA_FILES = {
 # Top-level directories valid inside a sysext.
 _ALLOWED_TOP_DIRS = {"usr", "opt"}
 
-# Top-level directories that would need the systemd factory pattern
-# (/usr/share/factory/...) to work in a sysext. We currently drop them
-# with a warning; implementing factory layout is a TODO.
-_FACTORY_PATTERN_DIRS = {"etc", "var"}
+# Top-level directories sysext won't overlay (only /usr and /opt are merged).
+# We translate them to a tmpfiles.d recipe shipped inside the sysext image.
+_TRANSLATED_TOP_DIRS = ("etc", "var")
+
+# Where translated file content lives inside the sysext image. Mirrors the
+# host layout (etc/foo → <skel>/<image>/etc/foo) so the tmpfiles `C` source
+# argument is a straightforward concatenation.
+_SKEL_DIR = "usr/share/pacman-sysext/skel"
+
+# tmpfiles.d recipes shipped inside the image. systemd-tmpfiles scans this
+# directory after sysext merge, materialising /etc and /var on the live root.
+_TMPFILES_DIR = "usr/lib/tmpfiles.d"
 
 
 class BuildError(Exception):
@@ -150,31 +160,163 @@ def _strip_unsupported_dirs(staging: Path, image_name: str) -> None:
     """Drop top-level entries that don't belong in a sysext.
 
     sysext is mounted read-only over /, so only /usr and /opt are valid
-    targets. /etc and /var would need the factory pattern; until that
-    lands we drop them and warn loudly so the user knows config/state
-    files were lost.
+    overlay targets. /etc and /var are handled separately by
+    `_translate_etc_and_var` (called before this); anything else
+    (stray /root, /tmp, …) is removed with a warning.
     """
     for entry in staging.iterdir():
         if entry.name in _ALLOWED_TOP_DIRS:
             continue
 
-        if entry.name in _FACTORY_PATTERN_DIRS:
-            logger.warning(
-                "Package %s ships /%s — dropping (factory pattern not implemented)",
-                image_name,
-                entry.name,
-            )
-        else:
-            logger.warning(
-                "Package %s has unexpected top-level entry: %s — removing",
-                image_name,
-                entry.name,
-            )
+        logger.warning(
+            "Package %s has unexpected top-level entry: %s — removing",
+            image_name,
+            entry.name,
+        )
 
-        if entry.is_dir():
+        if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
         else:
             entry.unlink()
+
+
+_TMPFILES_ESCAPE_TABLE = str.maketrans(
+    {
+        "\\": "\\\\",
+        " ": "\\x20",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\r": "\\r",
+    }
+)
+
+
+def _escape_tmpfiles_field(value: str) -> str:
+    """C-escape whitespace and backslash per tmpfiles.d(5) parsing rules.
+
+    The default-marker `-` must pass through verbatim — it signals "use the
+    default" for Mode/User/Group/Age/Argument. Other fields (paths,
+    symlink targets) are unconditionally escaped.
+    """
+    if value == "-":
+        return value
+    return value.translate(_TMPFILES_ESCAPE_TABLE)
+
+
+def _tmpfiles_line(
+    kind: str,
+    host_path: str,
+    mode: str = "-",
+    uid: str = "-",
+    gid: str = "-",
+    age: str = "-",
+    argument: str = "-",
+) -> str:
+    """Format one tmpfiles.d directive. Path and Argument are C-escaped."""
+    return " ".join(
+        [
+            kind,
+            _escape_tmpfiles_field(host_path),
+            mode,
+            uid,
+            gid,
+            age,
+            _escape_tmpfiles_field(argument),
+        ]
+    )
+
+
+def _iter_entries(root: Path) -> Iterator[Path]:
+    """Pre-order walk of `root` without following symlinks.
+
+    Pre-order ensures parent directories appear before their children in
+    the emitted recipe, which keeps the file readable; systemd-tmpfiles
+    creates intermediate parents automatically regardless.
+    """
+    for child in sorted(root.iterdir()):
+        yield child
+        if child.is_dir() and not child.is_symlink():
+            yield from _iter_entries(child)
+
+
+def _translate_etc_and_var(staging: Path, image_name: str) -> None:
+    """Relocate /etc and /var into the sysext-owned skel and emit a tmpfiles
+    recipe that re-materialises them on the live root after merge.
+
+    sysext only overlays /usr and /opt; raw /etc and /var contents would be
+    silently dropped at merge time. We move file content into
+    `/usr/share/pacman-sysext/skel/<image>/...` inside the image and write
+    `/usr/lib/tmpfiles.d/pacman-sysext-<image>.conf` with:
+
+    - `d` for directories — created with the package's mode/owner.
+    - `C` for regular files — copied to /etc or /var only if missing, so
+      admin edits made after first activation are preserved across refresh.
+    - `L+` for symlinks — recreated unconditionally (target encoded in the
+      directive itself; no skel content needed).
+
+    The original /etc and /var trees are deleted from the staging area
+    after translation: an empty /etc inside the .raw would shadow the
+    host's real /etc through the overlay.
+    """
+    lines: list[str] = []
+    skel_root_rel = Path(_SKEL_DIR) / image_name
+    skel_root_abs = staging / skel_root_rel
+
+    for top in _TRANSLATED_TOP_DIRS:
+        top_dir = staging / top
+        if not top_dir.is_dir() or top_dir.is_symlink():
+            continue
+        for entry in _iter_entries(top_dir):
+            lines.append(_translate_entry(entry, staging, skel_root_abs, skel_root_rel))
+        shutil.rmtree(top_dir)
+
+    if not lines:
+        return
+
+    recipe_dir = staging / _TMPFILES_DIR
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / f"pacman-sysext-{image_name}.conf"
+    header = (
+        f"# Generated by pacman-sysext for {image_name}.\n"
+        f"# Materialises files this package ships into /etc and /var.\n"
+    )
+    recipe.write_text(header + "\n".join(lines) + "\n")
+    logger.debug("Wrote tmpfiles recipe: %s (%d lines)", recipe, len(lines))
+
+
+def _translate_entry(
+    entry: Path,
+    staging: Path,
+    skel_root_abs: Path,
+    skel_root_rel: Path,
+) -> str:
+    """Translate one staged /etc or /var entry into a tmpfiles directive.
+
+    Side effect: regular files are moved into the skel tree; symlinks are
+    unlinked (their target is captured in the directive). Directories are
+    left in place so the iteration can descend into them; the whole
+    `etc/`/`var/` top-level tree is removed by the caller afterwards.
+    """
+    rel = entry.relative_to(staging)
+    host_path = "/" + rel.as_posix()
+    entry_stat = entry.lstat()
+    mode = f"{stat.S_IMODE(entry_stat.st_mode):04o}"
+    uid = str(entry_stat.st_uid)
+    gid = str(entry_stat.st_gid)
+
+    if entry.is_symlink():
+        target = os.readlink(entry)
+        entry.unlink()
+        return _tmpfiles_line("L+", host_path, "-", "-", "-", "-", target)
+
+    if entry.is_dir():
+        return _tmpfiles_line("d", host_path, mode, uid, gid)
+
+    dest = skel_root_abs / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(entry), dest)
+    source_host_path = "/" + (skel_root_rel / rel).as_posix()
+    return _tmpfiles_line("C", host_path, mode, uid, gid, "-", source_host_path)
 
 
 def _systemd_arch() -> str:
@@ -289,6 +431,7 @@ def build_sysext(
     with _staging_dir() as staging:
         _extract_package(pkg_file, staging)
         _clean_arch_metadata(staging)
+        _translate_etc_and_var(staging, image_name)
         _strip_unsupported_dirs(staging, image_name)
         _write_extension_release(staging, image_name)
         _make_image(staging, output_file, fs_format)

@@ -71,6 +71,19 @@ def refresh() -> None:
     _run_sysext(["systemd-sysext", "refresh"])
 
 
+def apply_tmpfiles() -> None:
+    """Run `systemd-tmpfiles --create` against the live root.
+
+    sysext doesn't overlay /etc or /var; the builder converts those paths
+    into a tmpfiles.d recipe shipped at /usr/lib/tmpfiles.d/pacman-sysext-*.conf
+    inside each image. Once the sysext is merged, this call materialises
+    the recipe so directories, copies (`C`), and symlinks (`L+`) appear on
+    the host.
+    """
+    logger.info("Applying tmpfiles recipes")
+    _run_sysext(["systemd-tmpfiles", "--create"])
+
+
 def is_refresh_supported() -> bool:
     """Check whether systemd-sysext understands the `refresh` verb."""
     try:
@@ -101,6 +114,10 @@ def activate_all(raw_paths: list[Path], extensions_dir: Path) -> None:
         with contextlib.suppress(SysextError):
             unmerge()
         merge()
+
+    # Must run AFTER the sysext is merged so /usr/lib/tmpfiles.d/pacman-sysext-*.conf
+    # is visible on the live root.
+    apply_tmpfiles()
 
 
 def _run_sysext(cmd: list[str]) -> None:

@@ -404,12 +404,16 @@ def _maybe_activate(outputs: list[Path], config: AppConfig, assume_yes: bool = F
     """
     if not outputs:
         return
-    print(f"\nWill link {len(outputs)} sysext(s) to {config.sysext.extensions_dir} and refresh:")
+    print(f"\nWill link {len(outputs)} sysext(s) to {config.sysext.extensions_dir}, refresh,")
+    print("and apply tmpfiles (materialises /etc and /var content from each sysext):")
     for raw in outputs:
         print(f"  - {raw.name}")
 
     if not _confirm("Activate now?", assume_yes=assume_yes):
-        print("Built but not activated. Run `sudo systemd-sysext refresh` after linking manually.")
+        print(
+            "Built but not activated. Run `sudo systemd-sysext refresh && "
+            "sudo systemd-tmpfiles --create` after linking manually."
+        )
         return
 
     try:
