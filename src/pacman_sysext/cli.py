@@ -1,6 +1,8 @@
 """Typer entry point for pacman-sysext."""
 
 import logging
+from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import typer
@@ -45,11 +47,33 @@ def install(
             "native host daemons (GDM, dbus, PAM) on boot."
         ),
     ),
+    time_sync_date: str | None = typer.Option(
+        None,
+        "--time-sync-date",
+        metavar="YYYY-MM-DD",
+        help=(
+            "Override the snapshot date for this install. Implies "
+            "time_sync.enabled = true. Useful for reproducible builds and "
+            "Arch-Linux-Archive gap-day workarounds."
+        ),
+    ),
 ) -> None:
     """Install package as sysext."""
+    config: AppConfig = ctx.obj
+    if time_sync_date is not None:
+        try:
+            override = date.fromisoformat(time_sync_date)
+        except ValueError as e:
+            typer.echo(f"Error: invalid --time-sync-date {time_sync_date!r}: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        config = replace(
+            config,
+            time_sync=replace(config.time_sync, enabled=True, date=override),
+        )
+
     install_cmd.run(
         package,
-        ctx.obj,
+        config,
         assume_yes=assume_yes,
         allow_host_abi_mismatch=allow_host_abi_mismatch,
     )

@@ -9,23 +9,25 @@ from pathlib import Path
 
 import typer
 
-from pacman_sysext import abi_gate, state
+from pacman_sysext import abi_gate, state, time_sync
 from pacman_sysext.abi_gate import ClassifiedDep, GateReport
 from pacman_sysext.builder import BuildError, build_sysext
-from pacman_sysext.config import AppConfig
+from pacman_sysext.config import AppConfig, PacmanConfig
 from pacman_sysext.pacman import (
     PacmanError,
+    ResolvedDep,
     download_package,
     find_unsatisfied,
     get_base_snapshot,
     get_package_dependencies,
     get_package_provides,
-    get_required_packages,
     parse_pkg_filename,
     query_system_packages,
+    resolve_required_packages,
     sync_databases,
 )
 from pacman_sysext.sysext import SysextError, activate_all
+from pacman_sysext.time_sync import TimeSyncError
 from pacman_sysext.version import (
     VersionConstraint,
     VersionError,
@@ -49,6 +51,14 @@ class BuildPlan:
     reused: list[tuple[str, str]] = field(default_factory=list)
     host_provided: list[str] = field(default_factory=list)
     integrity_failures: list[str] = field(default_factory=list)
+
+
+def _prepare_pacman(config: AppConfig) -> PacmanConfig:
+    """Return the resolver-facing PacmanConfig (sandbox or plain `pacman -Sy`)."""
+    if config.time_sync.enabled:
+        return time_sync.prepare_sandbox(config.time_sync, config.pacman)
+    sync_databases(config.pacman)
+    return config.pacman
 
 
 def _confirm(prompt: str, assume_yes: bool = False) -> bool:
@@ -216,6 +226,35 @@ def _print_gate_shadows(shadows: list[ClassifiedDep]) -> None:
     print(_format_gate_table(shadows))
 
 
+def _print_unmapped_block(
+    target_pkg: str,
+    unmapped: list[ResolvedDep],
+    snapshot_servers: dict[str, str],
+) -> None:
+    """Strict-policy block: dep comes from a repo with no snapshot backend."""
+    print(f"\nError: SNAPSHOT POLICY BLOCK — refusing to build sysext for {target_pkg}.\n")
+    print(
+        "Time-sync is enabled with policy = strict, but the following package(s)\n"
+        "were resolved from a repo that has no snapshot backend configured:\n"
+    )
+    width = max(len(d.name) for d in unmapped)
+    seen_repos: set[str] = set()
+    for dep in unmapped:
+        print(f"  {dep.name.ljust(width)}  from repo {dep.repo!r} ({dep.version})")
+        seen_repos.add(dep.repo)
+    configured = ", ".join(sorted(snapshot_servers)) or "(none)"
+    print(
+        "\nConfigured snapshot_servers: " + configured + "\n\n"
+        "Resolution:\n"
+        "  1) Add a snapshot backend for the listed repo(s) in "
+        "[time_sync.snapshot_servers].\n"
+        "  2) Or remove the third-party repo from the host so the resolver\n"
+        "     stops considering it.\n"
+        "  3) Or disable time-sync (time_sync.enabled = false) — at the cost of\n"
+        "     reintroducing ABI Gatekeeper false positives on rolling-immutable hosts."
+    )
+
+
 def _print_gate_block(target_pkg: str, blocks: list[ClassifiedDep], overridden: bool) -> None:
     header = "\n⚠ HOST ABI MISMATCH OVERRIDDEN" if overridden else "\nError: HOST ABI MISMATCH"
     verb = "will" if overridden else "would"
@@ -373,12 +412,27 @@ def run(
             _warn_about_drift(current_state, current_snapshot)
 
             try:
-                sync_databases(config.pacman)
-                required = get_required_packages(package, config.pacman)
-                target_deps = get_package_dependencies(package, config.pacman)
+                effective_pacman = _prepare_pacman(config)
+            except TimeSyncError as e:
+                print(f"Error: {e}")
+                raise typer.Exit(code=1) from e
+
+            try:
+                resolved = resolve_required_packages(package, effective_pacman)
+                target_deps = get_package_dependencies(package, effective_pacman)
             except (PacmanError, VersionError) as e:
                 print(f"Error: {e}")
                 raise typer.Exit(code=1) from e
+
+            if config.time_sync.enabled and config.time_sync.policy == "strict":
+                unmapped = [
+                    d for d in resolved if d.repo not in config.time_sync.snapshot_servers
+                ]
+                if unmapped:
+                    _print_unmapped_block(package, unmapped, config.time_sync.snapshot_servers)
+                    raise typer.Exit(code=1)
+
+            required = [d.filename for d in resolved]
 
             try:
                 _check_for_conflicts(current_state, package, target_deps)
@@ -407,12 +461,12 @@ def run(
                     raise typer.Exit(code=1)
 
             try:
-                download_package(package, config.pacman)
+                download_package(package, effective_pacman)
             except PacmanError as e:
                 print(f"Error: {e}")
                 raise typer.Exit(code=1) from e
 
-            cached_names = {f.name for f in config.pacman.cachedir.glob("*.pkg.tar.zst")}
+            cached_names = {f.name for f in effective_pacman.cachedir.glob("*.pkg.tar.zst")}
             required_set = set(required)
             missing = required_set - cached_names
             if missing:
@@ -449,7 +503,7 @@ def run(
 
             try:
                 for pkg_filename in plan.to_build:
-                    pkg_path = config.pacman.cachedir / pkg_filename
+                    pkg_path = effective_pacman.cachedir / pkg_filename
                     print(f"Building sysext from {pkg_filename}...")
                     output = build_sysext(
                         pkg_path,
@@ -462,14 +516,16 @@ def run(
                     name, version_str = parse_pkg_filename(pkg_path)
                     sha = state.compute_file_sha256(output)
                     try:
-                        provides = get_package_provides(name, config.pacman)
+                        provides = get_package_provides(name, effective_pacman)
                     except PacmanError as e:
                         logger.warning(
                             "Could not query provides for %s: %s; recording empty", name, e
                         )
                         provides = {}
                     try:
-                        depends = [c.name for c in get_package_dependencies(name, config.pacman)]
+                        depends = [
+                            c.name for c in get_package_dependencies(name, effective_pacman)
+                        ]
                     except PacmanError as e:
                         logger.warning(
                             "Could not query depends for %s: %s; recording empty", name, e

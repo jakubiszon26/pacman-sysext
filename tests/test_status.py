@@ -15,6 +15,7 @@ from rich.console import Console
 from pacman_sysext import state
 from pacman_sysext.commands import status as status_cmd
 from pacman_sysext.config import AppConfig, BuilderConfig, PacmanConfig, SysextConfig
+from pacman_sysext.time_sync import TimeSyncConfig
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -29,6 +30,7 @@ def _config(tmp_path: Path) -> AppConfig:
         builder=BuilderConfig(output_dir=base / "sysexts"),
         sysext=SysextConfig(extensions_dir=base / "extensions"),
         state_db=base / "state.db",
+        time_sync=TimeSyncConfig(),
     )
 
 
