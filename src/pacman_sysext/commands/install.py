@@ -289,132 +289,139 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
     build_outputs: list[Path] = []
     reused_outputs: list[Path] = []
 
-    with state.locked(config.state_db):
-        try:
+    try:
+        # `state.locked()` itself raises `StateError` on lock-acquisition
+        # timeout; `state.load()` raises it on a malformed state.db. The
+        # outer handler covers both with the same user-facing message.
+        with state.locked(config.state_db):
             current_state = state.load(config.state_db)
-        except state.StateError as e:
-            print(f"Error reading state: {e}")
-            raise typer.Exit(code=1) from e
 
-        try:
-            current_snapshot = get_base_snapshot()
-        except PacmanError as e:
-            print(f"Error: {e}")
-            raise typer.Exit(code=1) from e
-
-        _warn_about_drift(current_state, current_snapshot)
-
-        try:
-            sync_databases(config.pacman)
-            required = get_required_packages(package, config.pacman)
-            target_deps = get_package_dependencies(package, config.pacman)
-        except (PacmanError, VersionError) as e:
-            print(f"Error: {e}")
-            raise typer.Exit(code=1) from e
-
-        try:
-            _check_for_conflicts(current_state, package, target_deps)
-        except InstallConflictError as e:
-            print(f"Error: {e}")
-            raise typer.Exit(code=1) from e
-
-        try:
-            download_package(package, config.pacman)
-        except PacmanError as e:
-            print(f"Error: {e}")
-            raise typer.Exit(code=1) from e
-
-        cached_names = {f.name for f in config.pacman.cachedir.glob("*.pkg.tar.zst")}
-        required_set = set(required)
-        missing = required_set - cached_names
-        if missing:
-            print(f"Error: missing packages in cache: {sorted(missing)}")
-            raise typer.Exit(code=1)
-
-        plan = _make_build_plan(current_state, package, sorted(required_set), config)
-        _print_plan(plan)
-
-        if not plan.to_build:
-            print("\nNothing to build - all deps are already satisfied.")
-            target_version = _resolve_target_version(package, plan)
-            _record_user_request(current_state, package, target_version, target_deps)
             try:
+                current_snapshot = get_base_snapshot()
+            except PacmanError as e:
+                print(f"Error: {e}")
+                raise typer.Exit(code=1) from e
+
+            _warn_about_drift(current_state, current_snapshot)
+
+            try:
+                sync_databases(config.pacman)
+                required = get_required_packages(package, config.pacman)
+                target_deps = get_package_dependencies(package, config.pacman)
+            except (PacmanError, VersionError) as e:
+                print(f"Error: {e}")
+                raise typer.Exit(code=1) from e
+
+            try:
+                _check_for_conflicts(current_state, package, target_deps)
+            except InstallConflictError as e:
+                print(f"Error: {e}")
+                raise typer.Exit(code=1) from e
+
+            try:
+                download_package(package, config.pacman)
+            except PacmanError as e:
+                print(f"Error: {e}")
+                raise typer.Exit(code=1) from e
+
+            cached_names = {f.name for f in config.pacman.cachedir.glob("*.pkg.tar.zst")}
+            required_set = set(required)
+            missing = required_set - cached_names
+            if missing:
+                print(f"Error: missing packages in cache: {sorted(missing)}")
+                raise typer.Exit(code=1)
+
+            plan = _make_build_plan(current_state, package, sorted(required_set), config)
+            _print_plan(plan)
+
+            if not plan.to_build:
+                print("\nNothing to build - all deps are already satisfied.")
+                target_version = _resolve_target_version(package, plan)
+                _record_user_request(current_state, package, target_version, target_deps)
+                try:
+                    state.save(current_state, config.state_db)
+                except OSError as e:
+                    print(f"Error saving state: {e}")
+                    raise typer.Exit(code=1) from e
+                reused_outputs = _collect_reused_outputs(
+                    current_state, plan.reused, config.builder.output_dir
+                )
+                _maybe_activate(reused_outputs, config, assume_yes=assume_yes)
+                return
+
+            print(f"\nWill build {len(plan.to_build)} sysext(s):")
+            for pkg in plan.to_build:
+                print(f"  - {pkg}")
+
+            if not _confirm("Proceed with build?", assume_yes=assume_yes):
+                print("Aborted by user")
+                return
+
+            snapshot_id = state.intern_snapshot(current_state, current_snapshot)
+
+            try:
+                for pkg_filename in plan.to_build:
+                    pkg_path = config.pacman.cachedir / pkg_filename
+                    print(f"Building sysext from {pkg_filename}...")
+                    output = build_sysext(
+                        pkg_path,
+                        config.builder.output_dir,
+                        fs_format=config.builder.fs_format,
+                    )
+                    build_outputs.append(output)
+                    print(f"  ✓ {output.name}")
+
+                    name, version_str = parse_pkg_filename(pkg_path)
+                    sha = state.compute_file_sha256(output)
+                    try:
+                        provides = get_package_provides(name, config.pacman)
+                    except PacmanError as e:
+                        logger.warning(
+                            "Could not query provides for %s: %s; recording empty", name, e
+                        )
+                        provides = {}
+                    try:
+                        depends = [c.name for c in get_package_dependencies(name, config.pacman)]
+                    except PacmanError as e:
+                        logger.warning(
+                            "Could not query depends for %s: %s; recording empty", name, e
+                        )
+                        depends = []
+
+                    state.add_sysext(
+                        current_state,
+                        state.SysextRecord(
+                            name=name,
+                            version=version_str,
+                            raw_filename=output.name,
+                            fs_format=config.builder.fs_format,
+                            sha256=sha,
+                            installed_at=datetime.now(UTC),
+                            snapshot_id=snapshot_id,
+                            provides=provides,
+                            depends=depends,
+                        ),
+                    )
+
+                target_version = _resolve_target_version(package, plan)
+                _record_user_request(current_state, package, target_version, target_deps)
                 state.save(current_state, config.state_db)
+            except BuildError as e:
+                _cleanup_outputs(build_outputs)
+                print(f"  ✗ Error: {e}")
+                raise typer.Exit(code=1) from e
             except OSError as e:
+                _cleanup_outputs(build_outputs)
                 print(f"Error saving state: {e}")
                 raise typer.Exit(code=1) from e
+
+            print(f"\nBuilt {len(build_outputs)} sysext(s) in {config.builder.output_dir}")
             reused_outputs = _collect_reused_outputs(
                 current_state, plan.reused, config.builder.output_dir
             )
-            _maybe_activate(reused_outputs, config, assume_yes=assume_yes)
-            return
-
-        print(f"\nWill build {len(plan.to_build)} sysext(s):")
-        for pkg in plan.to_build:
-            print(f"  - {pkg}")
-
-        if not _confirm("Proceed with build?", assume_yes=assume_yes):
-            print("Aborted by user")
-            return
-
-        snapshot_id = state.intern_snapshot(current_state, current_snapshot)
-
-        try:
-            for pkg_filename in plan.to_build:
-                pkg_path = config.pacman.cachedir / pkg_filename
-                print(f"Building sysext from {pkg_filename}...")
-                output = build_sysext(
-                    pkg_path,
-                    config.builder.output_dir,
-                    fs_format=config.builder.fs_format,
-                )
-                build_outputs.append(output)
-                print(f"  ✓ {output.name}")
-
-                name, version_str = parse_pkg_filename(pkg_path)
-                sha = state.compute_file_sha256(output)
-                try:
-                    provides = get_package_provides(name, config.pacman)
-                except PacmanError as e:
-                    logger.warning("Could not query provides for %s: %s; recording empty", name, e)
-                    provides = {}
-                try:
-                    depends = [c.name for c in get_package_dependencies(name, config.pacman)]
-                except PacmanError as e:
-                    logger.warning("Could not query depends for %s: %s; recording empty", name, e)
-                    depends = []
-
-                state.add_sysext(
-                    current_state,
-                    state.SysextRecord(
-                        name=name,
-                        version=version_str,
-                        raw_filename=output.name,
-                        fs_format=config.builder.fs_format,
-                        sha256=sha,
-                        installed_at=datetime.now(UTC),
-                        snapshot_id=snapshot_id,
-                        provides=provides,
-                        depends=depends,
-                    ),
-                )
-
-            target_version = _resolve_target_version(package, plan)
-            _record_user_request(current_state, package, target_version, target_deps)
-            state.save(current_state, config.state_db)
-        except BuildError as e:
-            _cleanup_outputs(build_outputs)
-            print(f"  ✗ Error: {e}")
-            raise typer.Exit(code=1) from e
-        except OSError as e:
-            _cleanup_outputs(build_outputs)
-            print(f"Error saving state: {e}")
-            raise typer.Exit(code=1) from e
-
-        print(f"\nBuilt {len(build_outputs)} sysext(s) in {config.builder.output_dir}")
-        reused_outputs = _collect_reused_outputs(
-            current_state, plan.reused, config.builder.output_dir
-        )
+    except state.StateError as e:
+        print(f"Error reading state: {e}")
+        raise typer.Exit(code=1) from e
 
     _maybe_activate(build_outputs + reused_outputs, config, assume_yes=assume_yes)
 

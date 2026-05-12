@@ -555,6 +555,60 @@ class TestLocking:
 
         locked_mock.assert_called_once_with(config.state_db)
 
+    def test_lock_timeout_exits_cleanly(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A `StateError` from `state.locked()` must surface as `typer.Exit(1)`.
+
+        Driving the real flock timeout requires either waiting out
+        `_DEFAULT_LOCK_TIMEOUT` (300s) or patching the default arg —
+        defaults bind at function-definition time, so reassigning the
+        module constant is a no-op. Mocking the entry point is cleaner.
+        """
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+
+        def fake_locked(_path: Path) -> object:
+            raise state.StateError("could not acquire lock on /fake/lock within 0s")
+
+        with (
+            patch("pacman_sysext.commands.install.state.locked", side_effect=fake_locked),
+            pytest.raises(typer.Exit) as exc_info,
+        ):
+            install.run("htop", config)
+
+        assert exc_info.value.exit_code == 1
+        captured = capsys.readouterr()
+        assert "Error reading state" in captured.out
+        assert "could not acquire lock" in captured.out
+        # State must not have been touched.
+        assert not config.state_db.exists()
+
+    def test_malformed_state_db_exits_cleanly(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A `StateError` from `state.load()` flows through the same handler."""
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        config.state_db.parent.mkdir(parents=True, exist_ok=True)
+        config.state_db.write_text("{not valid json")
+        before = config.state_db.read_bytes()
+
+        with pytest.raises(typer.Exit) as exc_info:
+            install.run("htop", config)
+
+        assert exc_info.value.exit_code == 1
+        captured = capsys.readouterr()
+        assert "Error reading state" in captured.out
+        # State must not have been overwritten.
+        assert config.state_db.read_bytes() == before
+
 
 class TestTargetReuse:
     def test_target_reused_when_state_has_matching_hash(
