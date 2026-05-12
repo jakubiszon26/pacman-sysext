@@ -9,7 +9,8 @@ from pathlib import Path
 
 import typer
 
-from pacman_sysext import state
+from pacman_sysext import abi_gate, state
+from pacman_sysext.abi_gate import ClassifiedDep, GateReport
 from pacman_sysext.builder import BuildError, build_sysext
 from pacman_sysext.config import AppConfig
 from pacman_sysext.pacman import (
@@ -21,6 +22,7 @@ from pacman_sysext.pacman import (
     get_package_provides,
     get_required_packages,
     parse_pkg_filename,
+    query_system_packages,
     sync_databases,
 )
 from pacman_sysext.sysext import SysextError, activate_all
@@ -155,36 +157,34 @@ def _check_for_conflicts(
 
 def _make_build_plan(
     state_obj: state.State,
-    target_pkg: str,
-    required_filenames: list[str],
+    gate_report: GateReport,
     config: AppConfig,
 ) -> BuildPlan:
-    """Decide per dep whether to reuse, leave to host, or build."""
+    """Decide per dep whether to reuse, leave to host, or build.
+
+    `gate_report` is the sole source of truth for the host-vs-resolved
+    classification — `skip` means the host already provides it; `bundle`,
+    `shadow` and `block` are candidates for building (or reusing from
+    state). `block` entries only reach this function when the caller
+    decided to honor them (via `--allow-host-abi-mismatch`); without the
+    override the caller raises `typer.Exit` first.
+    """
     to_build: list[str] = []
     reused: list[tuple[str, str]] = []
-    host_provided: list[str] = []
+    host_provided: list[str] = [dep.name for dep in gate_report.skips]
     integrity_failures: list[str] = []
 
-    parsed = [(parse_pkg_filename(f), f) for f in required_filenames]
-    host_unsatisfied = find_unsatisfied([name for (name, _), _ in parsed])
-
-    for (name, version), filename in parsed:
-        record = state.get_sysext(state_obj, name, version)
+    for dep in (*gate_report.bundles, *gate_report.shadows, *gate_report.blocks):
+        record = state.get_sysext(state_obj, dep.name, dep.resolved_version)
         if record is not None:
             if state.verify_sysext_integrity(record, config.builder.output_dir):
-                reused.append((name, version))
+                reused.append((dep.name, dep.resolved_version))
                 continue
-            integrity_failures.append(state.sysext_key(name, version))
-            to_build.append(filename)
+            integrity_failures.append(state.sysext_key(dep.name, dep.resolved_version))
+            to_build.append(dep.filename)
             continue
 
-        # Target stays as a sysext regardless of host: the user explicitly asked
-        # for the sysext form. Only non-target deps may be skipped as host-provided.
-        if name != target_pkg and name not in host_unsatisfied:
-            host_provided.append(name)
-            continue
-
-        to_build.append(filename)
+        to_build.append(dep.filename)
 
     return BuildPlan(
         to_build=to_build,
@@ -192,6 +192,69 @@ def _make_build_plan(
         host_provided=host_provided,
         integrity_failures=integrity_failures,
     )
+
+
+def _format_gate_table(deps: list[ClassifiedDep]) -> str:
+    """Pretty-print one bucket of ClassifiedDep entries as an aligned table."""
+    if not deps:
+        return ""
+    width = max(len(d.name) for d in deps)
+    lines = []
+    for dep in deps:
+        host = dep.host_version if dep.host_version is not None else "(provides alias)"
+        lines.append(
+            f"  {dep.name.ljust(width)}  host has {host}, sysext would ship {dep.resolved_version}"
+        )
+    return "\n".join(lines)
+
+
+def _print_gate_shadows(shadows: list[ClassifiedDep]) -> None:
+    print(
+        f"\n⚠ Warning: {len(shadows)} cosmetic package(s) will shadow the host\n"
+        "  (safe-shadow exemption — fonts, icon themes; ABI doesn't apply):"
+    )
+    print(_format_gate_table(shadows))
+
+
+def _print_gate_block(target_pkg: str, blocks: list[ClassifiedDep], overridden: bool) -> None:
+    header = "\n⚠ HOST ABI MISMATCH OVERRIDDEN" if overridden else "\nError: HOST ABI MISMATCH"
+    verb = "will" if overridden else "would"
+    suffix = (
+        " — proceeding because --allow-host-abi-mismatch was set."
+        if overridden
+        else f" — refusing to build sysext for {target_pkg}."
+    )
+    print(f"{header}{suffix}\n")
+    print(
+        f"Installing {target_pkg} {verb} shadow the host with different versions of\n"
+        "the following packages. Native host daemons compiled against the host's\n"
+        "ABI may crash on boot (GDM, dbus, PAM, the graphical session):\n"
+    )
+    print(_format_gate_table(blocks))
+    if overridden:
+        print("\nYou own the risk. Keep a rescue shell / known-good snapshot handy.")
+    else:
+        print(
+            "\nResolution:\n"
+            "  1) Update the host first (sudo pacman -Syu) so its ABI catches up.\n"
+            "  2) Wait for the immutable image vendor to bump those libraries.\n"
+            "  3) Re-run with --allow-host-abi-mismatch if you understand the risk\n"
+            "     and have a recovery plan (rescue shell / known-good snapshot)."
+        )
+
+
+def _gather_host_state(required_filenames: list[str]) -> tuple[dict[str, str], set[str]]:
+    """Snapshot the host: installed packages and the names it satisfies (via provides too).
+
+    Returns `(host_packages, host_provided)`. Both are derived from
+    host-side pacman calls scoped to just the names in `required_filenames`
+    — a full `pacman -Q` is O(host packages) and would put thousands of
+    irrelevant entries in the critical install path.
+    """
+    required_names = sorted({parse_pkg_filename(f)[0] for f in required_filenames})
+    host_packages = query_system_packages(required_names)
+    host_provided = set(required_names) - find_unsatisfied(required_names)
+    return host_packages, host_provided
 
 
 def _warn_about_drift(state_obj: state.State, current_snapshot: dict[str, str]) -> None:
@@ -284,7 +347,12 @@ def _cleanup_outputs(outputs: list[Path]) -> None:
             logger.warning("Could not clean up orphaned %s: %s", output, e)
 
 
-def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
+def run(
+    package: str,
+    config: AppConfig,
+    assume_yes: bool = False,
+    allow_host_abi_mismatch: bool = False,
+) -> None:
     print(f"Installing sysext ({package})...")
     build_outputs: list[Path] = []
     reused_outputs: list[Path] = []
@@ -318,6 +386,26 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
                 print(f"Error: {e}")
                 raise typer.Exit(code=1) from e
 
+            # Pre-flight ABI Gatekeeper: classify before download/build so we
+            # never spend bandwidth on a transaction we are going to reject.
+            try:
+                host_packages, host_provided = _gather_host_state(required)
+                gate_report = abi_gate.classify(
+                    resolved_filenames=required,
+                    target_pkg=package,
+                    host_packages=host_packages,
+                    host_provided=host_provided,
+                )
+            except (PacmanError, VersionError) as e:
+                print(f"Error: {e}")
+                raise typer.Exit(code=1) from e
+            if gate_report.shadows:
+                _print_gate_shadows(gate_report.shadows)
+            if gate_report.blocks:
+                _print_gate_block(package, gate_report.blocks, overridden=allow_host_abi_mismatch)
+                if not allow_host_abi_mismatch:
+                    raise typer.Exit(code=1)
+
             try:
                 download_package(package, config.pacman)
             except PacmanError as e:
@@ -331,7 +419,7 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
                 print(f"Error: missing packages in cache: {sorted(missing)}")
                 raise typer.Exit(code=1)
 
-            plan = _make_build_plan(current_state, package, sorted(required_set), config)
+            plan = _make_build_plan(current_state, gate_report, config)
             _print_plan(plan)
 
             if not plan.to_build:

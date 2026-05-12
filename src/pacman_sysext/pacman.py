@@ -173,22 +173,44 @@ def find_unsatisfied(pkg_names: list[str]) -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def query_system_packages() -> dict[str, str]:
-    """Map name → version for every package installed on the host."""
-    result = _run_host_pacman(["-Q"])
-    if result.returncode != 0:
-        raise PacmanError(
-            f"pacman -Q failed with code {result.returncode}",
-            returncode=result.returncode,
-            stderr=result.stderr,
-            stdout=result.stdout,
-        )
+def query_system_packages(names: list[str] | None = None) -> dict[str, str]:
+    """Map name → version for host-installed packages.
+
+    With `names`, scopes the query to those entries via `pacman -Q
+    <names...>`. This is the form to prefer in hot paths — a bare
+    `pacman -Q` lists every package on the host (often thousands) and
+    spends measurable time on lines we are going to discard.
+
+    Names from `names` that the host does not have are silently omitted.
+    `pacman -Q` exits 1 in that case while still printing the satisfied
+    entries on stdout, so we parse the output regardless of exit code
+    when `names` is set. Without `names`, a non-zero exit is a real
+    failure and gets raised.
+    """
+    if names is None:
+        result = _run_host_pacman(["-Q"])
+        if result.returncode != 0:
+            raise PacmanError(
+                f"pacman -Q failed with code {result.returncode}",
+                returncode=result.returncode,
+                stderr=result.stderr,
+                stdout=result.stdout,
+            )
+    elif not names:
+        return {}
+    else:
+        result = _run_host_pacman(["-Q", *sorted(set(names))])
 
     packages = {}
     for line in result.stdout.strip().split("\n"):
         if not line:
             continue
-        name, version = line.split(" ", 1)
+        # Defensive split: keep going on a malformed line rather than crashing
+        # the install over a single weird `pacman -Q` row.
+        try:
+            name, version = line.split(" ", 1)
+        except ValueError:
+            continue
         packages[name] = version
 
     return packages

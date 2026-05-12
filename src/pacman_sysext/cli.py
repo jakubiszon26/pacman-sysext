@@ -36,9 +36,23 @@ def install(
     assume_yes: bool = typer.Option(
         False, "--yes", "-y", help="Skip confirmation prompts (for automation)."
     ),
+    allow_host_abi_mismatch: bool = typer.Option(
+        False,
+        "--allow-host-abi-mismatch",
+        help=(
+            "Bypass the ABI Gatekeeper and bundle libraries even when they would "
+            "shadow the host with a different version. Dangerous: may crash "
+            "native host daemons (GDM, dbus, PAM) on boot."
+        ),
+    ),
 ) -> None:
     """Install package as sysext."""
-    install_cmd.run(package, ctx.obj, assume_yes=assume_yes)
+    install_cmd.run(
+        package,
+        ctx.obj,
+        assume_yes=assume_yes,
+        allow_host_abi_mismatch=allow_host_abi_mismatch,
+    )
 
 
 @app.command()

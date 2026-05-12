@@ -58,6 +58,7 @@ def mocked(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         "get_base_snapshot",
         "download_package",
         "find_unsatisfied",
+        "query_system_packages",
         "build_sysext",
         "activate_all",
         "_confirm",
@@ -75,6 +76,10 @@ def _set_defaults(mocks: dict[str, MagicMock]) -> None:
     mocks["_confirm"].return_value = True
     mocks["get_base_snapshot"].return_value = {"glibc": "2.39-1"}
     mocks["find_unsatisfied"].return_value = set()  # everything host-satisfied by default
+    # The gate now also asks `pacman -Q` for installed versions. Default to an
+    # empty map so the gate falls back to the provides-set path (`host_provided`,
+    # derived from find_unsatisfied) and existing tests stay correct.
+    mocks["query_system_packages"].return_value = {}
     mocks["get_package_provides"].return_value = {}
     mocks["build_sysext"].side_effect = _fake_build
 
@@ -766,6 +771,250 @@ class TestAssumeYes:
         assert mocked["_confirm"].call_count == 2
         for call in mocked["_confirm"].call_args_list:
             assert call.kwargs.get("assume_yes") is True
+
+
+class TestAbiGatekeeper:
+    """Pre-flight gate stops shadowing installs before download.
+
+    The gate runs after dependency resolution (filename list known) but
+    before `download_package`. A block must short-circuit out without
+    pulling bandwidth, touching state, or building anything; an override
+    flag must let the install proceed with a loud warning.
+    """
+
+    def _seed_okular_with_glib_drift(self, config: AppConfig, mocked: dict[str, MagicMock]) -> None:
+        """Configure mocks for the SEV1 scenario:
+
+        host has glib2 2.78, but the resolved tree wants 2.80 — the gate
+        must block this.
+        """
+        mocked["get_required_packages"].return_value = [
+            "okular-24.12.1-1-x86_64.pkg.tar.zst",
+            "glib2-2.80.2-1-x86_64.pkg.tar.zst",
+        ]
+        mocked["get_package_dependencies"].return_value = []
+        # Both names exist on host (so they're in host_provided via -T),
+        # but glib2's version doesn't match the resolved tree.
+        mocked["find_unsatisfied"].return_value = set()
+        mocked["query_system_packages"].return_value = {
+            "glib2": "2.78.6-1",
+            "okular": "23.08.0-1",
+        }
+
+    def test_block_aborts_before_download(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        self._seed_okular_with_glib_drift(config, mocked)
+
+        with pytest.raises(typer.Exit) as exc_info:
+            install.run("okular", config)
+
+        assert exc_info.value.exit_code == 1
+        out = capsys.readouterr().out
+        assert "HOST ABI MISMATCH" in out
+        assert "glib2" in out
+        assert "host has 2.78.6-1" in out
+        assert "sysext would ship 2.80.2-1" in out
+        # Critical contract: we must NOT pull bandwidth on a rejected install.
+        mocked["download_package"].assert_not_called()
+        mocked["build_sysext"].assert_not_called()
+        # And state must be untouched.
+        assert not config.state_db.exists()
+
+    def test_block_message_lists_all_drifting_packages(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        mocked["get_required_packages"].return_value = [
+            "okular-24.12-1-x86_64.pkg.tar.zst",
+            "glib2-2.80-1-x86_64.pkg.tar.zst",
+            "systemd-libs-257-1-x86_64.pkg.tar.zst",
+            "pam-1.6.2-1-x86_64.pkg.tar.zst",
+        ]
+        mocked["get_package_dependencies"].return_value = []
+        mocked["query_system_packages"].return_value = {
+            "glib2": "2.78-1",
+            "systemd-libs": "256-1",
+            "pam": "1.6.1-1",
+        }
+
+        with pytest.raises(typer.Exit):
+            install.run("okular", config)
+
+        out = capsys.readouterr().out
+        assert "glib2" in out
+        assert "systemd-libs" in out
+        assert "pam" in out
+
+    def test_override_flag_proceeds_with_loud_warning(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        self._seed_okular_with_glib_drift(config, mocked)
+        _seed_cache(
+            config.pacman.cachedir,
+            ["okular-24.12.1-1-x86_64.pkg.tar.zst", "glib2-2.80.2-1-x86_64.pkg.tar.zst"],
+        )
+
+        install.run("okular", config, allow_host_abi_mismatch=True)
+
+        out = capsys.readouterr().out
+        assert "HOST ABI MISMATCH OVERRIDDEN" in out
+        assert "You own the risk" in out
+        # Build proceeded — both target and the shadowed glib2 became sysexts.
+        mocked["download_package"].assert_called_once()
+        built_filenames = {c.args[0].name for c in mocked["build_sysext"].call_args_list}
+        assert built_filenames == {
+            "okular-24.12.1-1-x86_64.pkg.tar.zst",
+            "glib2-2.80.2-1-x86_64.pkg.tar.zst",
+        }
+        # State landed.
+        result = state.load(config.state_db)
+        assert "okular" in result.user_requests
+        assert "glib2-2.80.2-1" in result.sysexts
+
+    def test_safe_shadow_proceeds_with_warning_no_override_needed(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Cosmetic drift (fonts/icons) takes the shadow path, not block."""
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        mocked["get_required_packages"].return_value = [
+            "okular-24.12-1-x86_64.pkg.tar.zst",
+            "ttf-dejavu-2.38-1-x86_64.pkg.tar.zst",
+        ]
+        mocked["get_package_dependencies"].return_value = []
+        mocked["query_system_packages"].return_value = {"ttf-dejavu": "2.37-1"}
+        _seed_cache(
+            config.pacman.cachedir,
+            ["okular-24.12-1-x86_64.pkg.tar.zst", "ttf-dejavu-2.38-1-x86_64.pkg.tar.zst"],
+        )
+
+        install.run("okular", config)
+
+        out = capsys.readouterr().out
+        assert "safe-shadow exemption" in out
+        assert "ttf-dejavu" in out
+        # No HOST ABI MISMATCH error — that's reserved for the block path.
+        assert "HOST ABI MISMATCH" not in out
+        # Shadowed package still gets built into the sysext.
+        built_filenames = {c.args[0].name for c in mocked["build_sysext"].call_args_list}
+        assert "ttf-dejavu-2.38-1-x86_64.pkg.tar.zst" in built_filenames
+
+    def test_exact_version_match_skips_dep_without_warning(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Version-aware skip: same version on host means the gate filters
+        the dep out cleanly — no warning, no block, no build for it.
+        """
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        mocked["get_required_packages"].return_value = [
+            "htop-3.5.1-1-x86_64.pkg.tar.zst",
+            "libcap-2.78-1-x86_64.pkg.tar.zst",
+        ]
+        mocked["get_package_dependencies"].return_value = []
+        mocked["query_system_packages"].return_value = {"libcap": "2.78-1"}
+        # libcap is on host; pacman -T agrees. Only target is unsatisfied.
+        mocked["find_unsatisfied"].return_value = {"htop"}
+        _seed_cache(
+            config.pacman.cachedir,
+            ["htop-3.5.1-1-x86_64.pkg.tar.zst", "libcap-2.78-1-x86_64.pkg.tar.zst"],
+        )
+
+        install.run("htop", config)
+
+        out = capsys.readouterr().out
+        assert "HOST ABI MISMATCH" not in out
+        assert "safe-shadow" not in out
+        # libcap skipped — only target built.
+        result = state.load(config.state_db)
+        assert set(result.sysexts.keys()) == {"htop-3.5.1-1"}
+
+    def test_target_pkg_bypasses_gate_even_if_host_has_same_name(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+    ) -> None:
+        """User-requested target always becomes a sysext — that's the point."""
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
+        mocked["get_package_dependencies"].return_value = []
+        # Host has an older htop. User wants the newer one as a sysext.
+        mocked["query_system_packages"].return_value = {"htop": "3.4.0-1"}
+        _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
+
+        install.run("htop", config)
+
+        # Target was built despite the version mismatch on the host.
+        built_filenames = {c.args[0].name for c in mocked["build_sysext"].call_args_list}
+        assert built_filenames == {"htop-3.5.1-1-x86_64.pkg.tar.zst"}
+
+    def test_gate_runs_before_conflict_check_does_not_short_circuit(
+        self,
+        tmp_path: Path,
+        mocked: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A user-request conflict still wins over the gate when both fire.
+
+        Conflict check runs before the gate in the current pipeline order;
+        we verify that a transaction triggering BOTH a conflict and an
+        ABI mismatch surfaces the conflict (the earlier check) so users
+        see one root cause at a time, not two stacked errors.
+        """
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+
+        initial = state.State()
+        state.add_user_request(
+            initial,
+            state.UserRequest(
+                name="neovim",
+                installed_version="0.10",
+                requested_at=datetime.now(UTC),
+                requirements={"libuv": "<2.0"},
+            ),
+        )
+        state.save(initial, config.state_db)
+
+        mocked["get_required_packages"].return_value = [
+            "nodejs-22-1-x86_64.pkg.tar.zst",
+            "glib2-2.80-1-x86_64.pkg.tar.zst",
+        ]
+        mocked["get_package_dependencies"].return_value = [
+            VersionConstraint("libuv", ">=", "2.0"),
+        ]
+        mocked["query_system_packages"].return_value = {"glib2": "2.78-1"}
+
+        with pytest.raises(typer.Exit):
+            install.run("nodejs", config)
+
+        out = capsys.readouterr().out
+        assert "cannot install nodejs" in out
+        # Gate never fired because conflict aborted first.
+        assert "HOST ABI MISMATCH" not in out
+        mocked["download_package"].assert_not_called()
 
 
 class TestConstraintsOverlap:
