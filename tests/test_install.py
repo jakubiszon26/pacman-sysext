@@ -53,7 +53,6 @@ def mocked(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     for name in (
         "sync_databases",
         "get_required_packages",
-        "get_package_version",
         "get_package_dependencies",
         "get_package_provides",
         "get_base_snapshot",
@@ -90,7 +89,6 @@ class TestFreshInstall:
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
         ]
-        mocked["get_package_version"].return_value = "3.5.1-1"
 
         def deps_for(name: str, _config: object) -> list[VersionConstraint]:
             return {
@@ -124,6 +122,35 @@ class TestFreshInstall:
         assert result.sysexts["htop-3.5.1-1"].depends == ["libcap"]
         assert result.sysexts["libcap-2.78-1"].depends == []
 
+    def test_user_request_version_matches_filename_not_pacman_si(
+        self, tmp_path: Path, mocked: dict[str, MagicMock]
+    ) -> None:
+        """Regression: pacman -Si may report a different pkgrel than the file.
+
+        CachyOS rebuilds bump pkgrel from `1` to `1.1`, but `pacman -Si`
+        sometimes still reports the upstream string. The UserRequest must
+        track the filename-derived version so get_explicit's strict lookup
+        keeps working.
+        """
+        config = _config(tmp_path)
+        _set_defaults(mocked)
+        mocked["get_required_packages"].return_value = [
+            "grafana-12.4.2-1.1-x86_64_v4.pkg.tar.zst",
+        ]
+        # pacman -Si reports the upstream version, intentionally divergent
+        # from the filename pkgrel.
+        mocked["get_package_dependencies"].return_value = []
+        mocked["find_unsatisfied"].return_value = {"grafana"}
+        _seed_cache(config.pacman.cachedir, ["grafana-12.4.2-1.1-x86_64_v4.pkg.tar.zst"])
+
+        install.run("grafana", config)
+
+        result = state.load(config.state_db)
+        # The sysext key uses the filename version.
+        assert "grafana-12.4.2-1.1" in result.sysexts
+        # The user request must point at the same version, not pacman's.
+        assert result.user_requests["grafana"].installed_version == "12.4.2-1.1"
+
     def test_depends_query_failure_records_empty_depends(
         self, tmp_path: Path, mocked: dict[str, MagicMock]
     ) -> None:
@@ -135,7 +162,6 @@ class TestFreshInstall:
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
         ]
-        mocked["get_package_version"].return_value = "3.5.1-1"
 
         def deps_for(name: str, _config: object) -> list[VersionConstraint]:
             if name == "libcap":
@@ -191,7 +217,6 @@ class TestReinstall:
         state.save(initial, config.state_db)
 
         mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -216,7 +241,6 @@ class TestHostSatisfied:
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
         ]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         # only htop is unsatisfied; libcap is on host
         mocked["find_unsatisfied"].return_value = {"htop"}
@@ -267,7 +291,6 @@ class TestSysextReuse:
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
         ]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
         _seed_cache(
@@ -314,7 +337,6 @@ class TestSysextReuse:
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
         ]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
         _seed_cache(
@@ -359,7 +381,6 @@ class TestConflict:
 
         # Now install nodejs which wants libuv>=2.0
         mocked["get_required_packages"].return_value = ["nodejs-22-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "22-1"
         mocked["get_package_dependencies"].return_value = [
             VersionConstraint("libuv", ">=", "2.0"),
         ]
@@ -381,7 +402,6 @@ class TestBuildFailure:
         config = _config(tmp_path)
         _set_defaults(mocked)
         mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -424,7 +444,6 @@ class TestDriftWarning:
 
         mocked["get_base_snapshot"].return_value = {"glibc": "2.40-1"}
         mocked["get_required_packages"].return_value = ["nano-7-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "7-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"nano"}
         _seed_cache(config.pacman.cachedir, ["nano-7-1-x86_64.pkg.tar.zst"])
@@ -460,7 +479,6 @@ class TestDriftWarning:
 
         mocked["get_base_snapshot"].return_value = {"glibc": "2.40-1"}
         mocked["get_required_packages"].return_value = ["nano-7-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "7-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"nano"}
         _seed_cache(config.pacman.cachedir, ["nano-7-1-x86_64.pkg.tar.zst"])
@@ -477,7 +495,6 @@ class TestDriftWarning:
         config = _config(tmp_path)
         _set_defaults(mocked)
         mocked["get_required_packages"].return_value = ["nano-7-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "7-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"nano"}
         _seed_cache(config.pacman.cachedir, ["nano-7-1-x86_64.pkg.tar.zst"])
@@ -499,7 +516,6 @@ class TestSnapshotInterning:
             "libcap-2.78-1-x86_64.pkg.tar.zst",
             "libnl-3.7-1-x86_64.pkg.tar.zst",
         ]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap", "libnl"}
         _seed_cache(
@@ -526,7 +542,6 @@ class TestLocking:
         config = _config(tmp_path)
         _set_defaults(mocked)
         mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -572,7 +587,6 @@ class TestTargetReuse:
         state.save(initial, config.state_db)
 
         mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -607,7 +621,6 @@ class TestOrphanCleanup:
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
         ]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
         _seed_cache(
@@ -659,7 +672,6 @@ class TestConflictMessage:
         state.save(initial, config.state_db)
 
         mocked["get_required_packages"].return_value = ["nodejs-22-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "22-1"
         mocked["get_package_dependencies"].return_value = [
             VersionConstraint("libuv", ">=", "2.0"),
         ]
@@ -690,7 +702,6 @@ class TestAssumeYes:
         config = _config(tmp_path)
         _set_defaults(mocked)
         mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
-        mocked["get_package_version"].return_value = "3.5.1-1"
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])

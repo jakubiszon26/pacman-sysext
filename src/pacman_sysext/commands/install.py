@@ -19,7 +19,6 @@ from pacman_sysext.pacman import (
     get_base_snapshot,
     get_package_dependencies,
     get_package_provides,
-    get_package_version,
     get_required_packages,
     parse_pkg_filename,
     sync_databases,
@@ -244,6 +243,26 @@ def _record_user_request(
     )
 
 
+def _resolve_target_version(target_pkg: str, plan: BuildPlan) -> str:
+    """Pull the canonical target version from the build plan.
+
+    The filename is the only source of truth that matches what we
+    actually stored as `SysextRecord.version` and used in the
+    `.raw`/state key. `pacman -Si <target>` can return a different
+    string (e.g. CachyOS rebuild pkgrels like `1.1` where Arch's
+    metadata still says `1`), which would desync UserRequest from
+    SysextRecord and break later graph lookups.
+    """
+    for filename in plan.to_build:
+        name, version = parse_pkg_filename(filename)
+        if name == target_pkg:
+            return version
+    for name, version in plan.reused:
+        if name == target_pkg:
+            return version
+    raise RuntimeError(f"target {target_pkg!r} missing from build plan (to_build + reused)")
+
+
 def _collect_reused_outputs(
     state_obj: state.State, reused: list[tuple[str, str]], output_dir: Path
 ) -> list[Path]:
@@ -288,7 +307,6 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
         try:
             sync_databases(config.pacman)
             required = get_required_packages(package, config.pacman)
-            target_version = get_package_version(package, config.pacman)
             target_deps = get_package_dependencies(package, config.pacman)
         except (PacmanError, VersionError) as e:
             print(f"Error: {e}")
@@ -318,6 +336,7 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
 
         if not plan.to_build:
             print("\nNothing to build - all deps are already satisfied.")
+            target_version = _resolve_target_version(package, plan)
             _record_user_request(current_state, package, target_version, target_deps)
             try:
                 state.save(current_state, config.state_db)
@@ -380,6 +399,7 @@ def run(package: str, config: AppConfig, assume_yes: bool = False) -> None:
                     ),
                 )
 
+            target_version = _resolve_target_version(package, plan)
             _record_user_request(current_state, package, target_version, target_deps)
             state.save(current_state, config.state_db)
         except BuildError as e:

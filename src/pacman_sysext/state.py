@@ -368,17 +368,46 @@ def get_explicit(state: State) -> list[SysextRecord]:
     """SysextRecords the user explicitly requested.
 
     Resolves each `UserRequest` to the matching `(name, installed_version)`
-    sysext record. Requests without a backing record are skipped silently
-    — that pathology is surfaced by `audit_integrity` instead. Output is
-    sorted by `installed_at` for stable rendering.
+    sysext record. When the strict match fails, falls back to a loose
+    match keyed on `name` and a pkgrel-suffix relationship between the
+    versions — this rescues legacy entries written before install
+    started using the filename-derived version as the canonical one
+    (e.g. UserRequest `12.4.2-1` vs SysextRecord `12.4.2-1.1` on
+    CachyOS rebuilds).
+
+    Requests with no record at all are skipped silently — that pathology
+    is surfaced by `audit_integrity` instead. Output is sorted by
+    `installed_at` for stable rendering.
     """
     matched: list[SysextRecord] = []
     for req in state.user_requests.values():
         record = get_sysext(state, req.name, req.installed_version)
+        if record is None:
+            record = _loose_version_match(state, req.name, req.installed_version)
         if record is not None:
             matched.append(record)
     matched.sort(key=lambda r: r.installed_at)
     return matched
+
+
+def _loose_version_match(state: State, name: str, requested_version: str) -> SysextRecord | None:
+    """Best-effort match when UserRequest version doesn't equal the record.
+
+    Accepts records whose version exactly equals `requested_version` or
+    extends it with a `.<suffix>` (so `12.4.2-1` matches `12.4.2-1.1`
+    but not `12.4.2-10`). When multiple candidates qualify, picks the
+    most recently installed one.
+    """
+    prefix = requested_version + "."
+    candidates = [
+        r
+        for r in find_sysexts_by_name(state, name)
+        if r.version == requested_version or r.version.startswith(prefix)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: r.installed_at, reverse=True)
+    return candidates[0]
 
 
 def get_implicit(

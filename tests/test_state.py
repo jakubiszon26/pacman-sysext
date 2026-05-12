@@ -547,6 +547,54 @@ class TestStatusHelpers:
         add_user_request(state, _make_request("htop", "999.0", {}))
         assert get_explicit(state) == []
 
+    def test_get_explicit_loose_match_on_cachyos_pkgrel_suffix(self) -> None:
+        """UserRequest `12.4.2-1` must still resolve to SysextRecord `12.4.2-1.1`.
+
+        Reproduces the bug observed on CachyOS where the repo's
+        rebuilt pkgrel (`-1.1`) ends up in the sysext filename and
+        record version while `pacman -Si` reported the upstream `-1`.
+        """
+        state = State()
+        add_sysext(state, _make_sysext("grafana", "12.4.2-1.1"))
+        add_user_request(state, _make_request("grafana", "12.4.2-1", {}))
+        result = get_explicit(state)
+        assert [(r.name, r.version) for r in result] == [("grafana", "12.4.2-1.1")]
+
+    def test_get_explicit_loose_match_does_not_overreach(self) -> None:
+        """`1-1` must not loose-match `1-10` — only `.<suffix>` extensions count."""
+        state = State()
+        add_sysext(state, _make_sysext("foo", "1-10"))
+        add_user_request(state, _make_request("foo", "1-1", {}))
+        assert get_explicit(state) == []
+
+    def test_get_explicit_loose_match_picks_most_recent_candidate(self) -> None:
+        state = State()
+        older = SysextRecord(
+            name="foo",
+            version="1-1.1",
+            raw_filename="foo-1-1.1.raw",
+            fs_format="squashfs",
+            sha256="a",
+            installed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            snapshot_id="s",
+            provides={},
+        )
+        newer = SysextRecord(
+            name="foo",
+            version="1-1.2",
+            raw_filename="foo-1-1.2.raw",
+            fs_format="squashfs",
+            sha256="b",
+            installed_at=datetime(2026, 5, 1, tzinfo=UTC),
+            snapshot_id="s",
+            provides={},
+        )
+        add_sysext(state, older)
+        add_sysext(state, newer)
+        add_user_request(state, _make_request("foo", "1-1", {}))
+        result = get_explicit(state)
+        assert [r.version for r in result] == ["1-1.2"]
+
     def test_get_implicit_walks_depends_without_resolver(self) -> None:
         state = State()
         add_sysext(state, _make_sysext("htop", "1", depends=["ncurses"]))
