@@ -82,10 +82,11 @@ class TestEscapeTmpfilesField:
         ("raw", "expected"),
         [
             ("/etc/htop", "/etc/htop"),
-            ("/etc/with space", "/etc/with\\x20space"),
+            ("/etc/with space", "/etc/with\\sspace"),
             ("/etc/back\\slash", "/etc/back\\\\slash"),
             ("/etc/tab\there", "/etc/tab\\there"),
             ("/etc/newline\n", "/etc/newline\\n"),
+            ("/etc/cr\r", "/etc/cr\\r"),
             ("-", "-"),  # default marker passes through untouched
         ],
     )
@@ -114,9 +115,9 @@ class TestTmpfilesLine:
         )
 
     def test_path_with_space_escaped_but_dash_preserved(self) -> None:
-        # Mode/User/Group "-" must not get mangled into "\x2d" or similar.
+        # Mode/User/Group "-" must not get mangled into "\s" or similar.
         result = _tmpfiles_line("C", "/etc/a b", "-", "-", "-", "-", "/usr/share/a b")
-        assert result == "C /etc/a\\x20b - - - - /usr/share/a\\x20b"
+        assert result == "C /etc/a\\sb - - - - /usr/share/a\\sb"
 
 
 class TestTranslateEtcAndVar:
@@ -157,7 +158,9 @@ class TestTranslateEtcAndVar:
         # /var directory entry
         assert any(line.startswith("d /var/lib/myapp ") for line in content.splitlines()), content
 
-    def test_symlinks_emit_l_plus_and_are_not_relocated(self, tmp_path: Path) -> None:
+    def test_etc_symlinks_emit_L_not_clobbering(self, tmp_path: Path) -> None:
+        # /etc is admin-mutable; `L` only creates the symlink when the host
+        # path is empty, preserving any custom override the admin made.
         (tmp_path / "etc").mkdir()
         link = tmp_path / "etc" / "foo"
         link.symlink_to("/usr/share/htop/foo")
@@ -166,11 +169,23 @@ class TestTranslateEtcAndVar:
 
         recipe = tmp_path / "usr/lib/tmpfiles.d/pacman-sysext-pkg-1.0-1.conf"
         content = recipe.read_text()
-        assert "L+ /etc/foo - - - - /usr/share/htop/foo" in content
+        assert "L /etc/foo - - - - /usr/share/htop/foo" in content
         # The symlink itself should not appear in skel — its target is
         # encoded entirely in the directive.
         assert not (tmp_path / "usr/share/pacman-sysext/skel/pkg-1.0-1/etc/foo").exists()
         assert not (tmp_path / "usr/share/pacman-sysext/skel/pkg-1.0-1/etc/foo").is_symlink()
+
+    def test_var_symlinks_emit_L_plus(self, tmp_path: Path) -> None:
+        # /var is package-managed state; `L+` is correct so a stale symlink
+        # left over from a prior install is overwritten.
+        (tmp_path / "var" / "lib").mkdir(parents=True)
+        link = tmp_path / "var" / "lib" / "foo"
+        link.symlink_to("/usr/share/foo")
+
+        _translate_etc_and_var(tmp_path, "pkg-1.0-1")
+
+        content = (tmp_path / "usr/lib/tmpfiles.d/pacman-sysext-pkg-1.0-1.conf").read_text()
+        assert "L+ /var/lib/foo - - - - /usr/share/foo" in content
 
     def test_no_recipe_when_etc_and_var_absent(self, tmp_path: Path) -> None:
         (tmp_path / "usr").mkdir()
@@ -211,6 +226,88 @@ class TestTranslateEtcAndVar:
         idx_b = next(i for i, line in enumerate(lines) if " /etc/a/b " in line)
         idx_leaf = next(i for i, line in enumerate(lines) if line.startswith("C /etc/a/b/leaf "))
         assert idx_a < idx_b < idx_leaf
+
+    def test_fifo_is_skipped_with_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # pacman would never ship a FIFO in /etc, but a hostile or
+        # corrupted archive could. `C` source must be a regular file or
+        # directory — anything else gets dropped with a warning rather
+        # than silently embedded as a non-functional directive.
+        (tmp_path / "etc").mkdir()
+        fifo = tmp_path / "etc" / "named.pipe"
+        os.mkfifo(fifo)
+
+        with caplog.at_level("WARNING"):
+            _translate_etc_and_var(tmp_path, "pkg-1.0-1")
+
+        # No recipe should reference the fifo
+        recipe = tmp_path / "usr/lib/tmpfiles.d/pacman-sysext-pkg-1.0-1.conf"
+        if recipe.exists():
+            assert "/etc/named.pipe" not in recipe.read_text()
+        # Skel must not contain the fifo either
+        assert not (tmp_path / "usr/share/pacman-sysext/skel/pkg-1.0-1/etc/named.pipe").exists()
+        assert any("non-regular" in r.message.lower() for r in caplog.records)
+
+    def test_header_is_escaped_defense_in_depth(self, tmp_path: Path) -> None:
+        # sanitize_image_name rejects pathological inputs upstream, but the
+        # translator escapes the header anyway. We bypass the validator
+        # here by calling the translator directly with a payload that
+        # would otherwise synthesize a live tmpfiles directive on the
+        # line following the comment. Slashes are excluded from the
+        # payload so the recipe filename remains a single path component;
+        # the escape concern is about the header *body*, not the filename.
+        (tmp_path / "etc").mkdir()
+        (tmp_path / "etc" / "real.conf").write_text("ok")
+
+        payload = "evil\nINJECTED_DIRECTIVE"
+        _translate_etc_and_var(tmp_path, payload)
+
+        recipe_dir = tmp_path / "usr/lib/tmpfiles.d"
+        recipes = list(recipe_dir.iterdir())
+        assert len(recipes) == 1
+        content = recipes[0].read_text()
+        # The header must not break into a second line; the embedded
+        # newline must materialise as a literal backslash-n inside the
+        # comment, leaving the parser on a single # line.
+        lines = content.splitlines()
+        # First line is the header comment — must contain BOTH the prefix
+        # and the escaped payload, all in one line.
+        assert lines[0].startswith("# Generated by pacman-sysext for evil\\nINJECTED_DIRECTIVE")
+        # No real newline split inside the header.
+        assert "INJECTED_DIRECTIVE" not in [line.lstrip("# ").strip() for line in lines[1:]]
+
+
+class TestSanitizeImageNameValidation:
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            "foo\n",
+            "foo with space",
+            "foo\tbar",
+            "foo;bar",
+            "foo/bar",  # path separator, the most dangerous one
+            "foo$bar",
+        ],
+    )
+    def test_rejects_unsafe_chars(self, bad_name: str) -> None:
+        with pytest.raises(BuildError, match="whitelist"):
+            sanitize_image_name(bad_name, "1-1")
+
+    def test_rejects_unsafe_version(self) -> None:
+        with pytest.raises(BuildError, match="whitelist"):
+            sanitize_image_name("htop", "3.5\n1-1")
+
+    def test_accepts_real_pacman_names(self) -> None:
+        # Smoke test: nothing in the real Arch repo should trip the whitelist.
+        for n, v in [
+            ("htop", "3.5.1-1"),
+            ("gtk+", "2.24.33-3"),
+            ("lib32-glibc", "2.39-1"),
+            ("lensfun", "1:0.3.4-6.1"),  # epoch → '+'
+            ("zlib-ng-compat", "2.1.6-1"),
+        ]:
+            assert sanitize_image_name(n, v)
 
 
 class TestMakeImage:
