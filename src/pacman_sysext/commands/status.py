@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from datetime import date
 from pathlib import Path
 
 import typer
@@ -13,11 +12,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from pacman_sysext import state, time_sync
+from pacman_sysext import state
 from pacman_sysext.config import AppConfig
 from pacman_sysext.pacman import PacmanError, get_package_dependencies
 from pacman_sysext.state import IntegrityReport, SysextRecord
-from pacman_sysext.time_sync import TimeSyncError
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +57,6 @@ def run(config: AppConfig, console: Console | None = None) -> None:
         print(f"Error reading state: {e}")
         raise typer.Exit(code=1) from e
 
-    host_snapshot_date = _maybe_host_snapshot_date(
-        [*explicit, *implicit, *orphans]
-    )
     _render(
         console,
         report=report,
@@ -69,29 +64,7 @@ def run(config: AppConfig, console: Console | None = None) -> None:
         implicit=implicit,
         orphans=orphans,
         sizes=sizes,
-        host_snapshot_date=host_snapshot_date,
     )
-
-
-_HOST_SYNC_DIR = Path("/var/lib/pacman/sync")
-
-
-def _maybe_host_snapshot_date(records: list[SysextRecord]) -> date | None:
-    """Best-effort *observed* host snapshot date for drift detection.
-
-    Fires whenever any record carries a `pinned_date` — that signal is
-    record-driven (an `--time-sync-date` one-shot install leaves a pinned
-    record even when config returns to disabled), so we recompute the
-    live host DB age every time the state would benefit from a comparison.
-    Returns None on any backend hiccup so status stays renderable.
-    """
-    if not any(r.pinned_date is not None for r in records):
-        return None
-    try:
-        return time_sync.derive_snapshot_date(_HOST_SYNC_DIR)
-    except TimeSyncError as e:
-        logger.info("could not derive host snapshot date for drift hint: %s", e)
-        return None
 
 
 def _collect_sizes(records: Iterable[SysextRecord], output_dir: Path) -> dict[str, int]:
@@ -115,7 +88,6 @@ def _render(
     implicit: list[SysextRecord],
     orphans: list[SysextRecord],
     sizes: dict[str, int],
-    host_snapshot_date: date | None,
 ) -> None:
     has_audit_issues = bool(report.missing_files or report.unregistered_files or report.scan_error)
     if has_audit_issues:
@@ -127,39 +99,6 @@ def _render(
         console.print(_orphans_panel(orphans, sizes))
 
     console.print(_summary_table(explicit, implicit, orphans, sizes))
-
-    if host_snapshot_date is not None:
-        # Orphans participate too: a stale pinned orphan still occupies the
-        # output dir and may be re-promoted via reinstall, so its drift is
-        # actionable signal — and the gating in `_maybe_host_snapshot_date`
-        # already counts orphans as evidence that the user opted into
-        # time-sync at some point.
-        hint = _snapshot_drift_hint(
-            [*explicit, *implicit, *orphans], host_snapshot_date
-        )
-        if hint is not None:
-            console.print(hint)
-
-
-def _snapshot_drift_hint(
-    records: list[SysextRecord], host_snapshot_date: date
-) -> Text | None:
-    """One-line drift hint when pinned dates lag the host's current snapshot.
-
-    Records without a `pinned_date` (legacy or non-time-sync installs)
-    do not count toward drift — they were never pinned, so they can't drift.
-    """
-    pinned = [r for r in records if r.pinned_date is not None]
-    stale = [r for r in pinned if r.pinned_date != host_snapshot_date]
-    if not stale:
-        return None
-    stale_dates = sorted({r.pinned_date.isoformat() for r in stale if r.pinned_date})
-    return Text(
-        f"\n⚠ {len(stale)} sysext(s) were pinned to {', '.join(stale_dates)}; "
-        f"host snapshot is now {host_snapshot_date.isoformat()}. "
-        f"Rebuild for ABI consistency.",
-        style="yellow",
-    )
 
 
 def _audit_panel(report: IntegrityReport) -> Panel:
@@ -190,18 +129,15 @@ def _explicit_table(explicit: list[SysextRecord]) -> Table:
     table = Table(title="Explicit packages", title_style="bold", header_style="bold")
     table.add_column("Package")
     table.add_column("Version")
-    table.add_column("Pinned")
     table.add_column("Installed at")
     for record in explicit:
-        pinned = record.pinned_date.isoformat() if record.pinned_date else "—"
         table.add_row(
             record.name,
             record.version,
-            pinned,
             record.installed_at.isoformat(timespec="seconds"),
         )
     if not explicit:
-        table.add_row("(none)", "", "", "")
+        table.add_row("(none)", "", "")
     return table
 
 

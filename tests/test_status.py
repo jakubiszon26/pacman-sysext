@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,7 +15,6 @@ from rich.console import Console
 from pacman_sysext import state
 from pacman_sysext.commands import status as status_cmd
 from pacman_sysext.config import AppConfig, BuilderConfig, PacmanConfig, SysextConfig
-from pacman_sysext.time_sync import TimeSyncConfig
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -30,7 +29,6 @@ def _config(tmp_path: Path) -> AppConfig:
         builder=BuilderConfig(output_dir=base / "sysexts"),
         sysext=SysextConfig(extensions_dir=base / "extensions"),
         state_db=base / "state.db",
-        time_sync=TimeSyncConfig(),
     )
 
 
@@ -45,7 +43,6 @@ def _record(
     snapshot_id: str,
     depends: list[str] | None = None,
     sha: str = "x",
-    pinned_date: date | None = None,
 ) -> state.SysextRecord:
     return state.SysextRecord(
         name=name,
@@ -57,7 +54,6 @@ def _record(
         snapshot_id=snapshot_id,
         provides={},
         depends=depends or [],
-        pinned_date=pinned_date,
     )
 
 
@@ -308,253 +304,6 @@ def test_status_exits_cleanly_on_lock_timeout(
     captured = capsys.readouterr()
     assert "Error reading state" in captured.out
     assert "could not acquire lock" in captured.out
-
-
-def test_explicit_table_renders_pinned_column(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
-    raw_bytes = b"htop"
-    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
-
-    current = state.State()
-    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
-    state.add_sysext(
-        current,
-        _record(
-            "htop",
-            "3.5.1-1",
-            snapshot_id=snap_id,
-            sha=hashlib.sha256(raw_bytes).hexdigest(),
-            pinned_date=date(2025, 5, 1),
-        ),
-    )
-    state.add_user_request(
-        current,
-        state.UserRequest(
-            name="htop",
-            installed_version="3.5.1-1",
-            requested_at=_now(),
-            requirements={},
-        ),
-    )
-    state.save(current, config.state_db)
-
-    console = _capturing_console()
-    status_cmd.run(config, console=console)
-    out = console.export_text()
-    assert "Pinned" in out
-    assert "2025-05-01" in out
-
-
-def test_explicit_table_shows_dash_for_unpinned_records(tmp_path: Path) -> None:
-    """Records without pinned_date render `—` in the Pinned column."""
-    config = _config(tmp_path)
-    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
-    raw_bytes = b"htop"
-    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
-
-    current = state.State()
-    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
-    state.add_sysext(
-        current,
-        _record("htop", "3.5.1-1", snapshot_id=snap_id,
-                sha=hashlib.sha256(raw_bytes).hexdigest()),
-    )
-    state.add_user_request(
-        current,
-        state.UserRequest(
-            name="htop",
-            installed_version="3.5.1-1",
-            requested_at=_now(),
-            requirements={},
-        ),
-    )
-    state.save(current, config.state_db)
-
-    console = _capturing_console()
-    status_cmd.run(config, console=console)
-    out = console.export_text()
-    assert "—" in out
-
-
-def _seed_pinned_record(config: AppConfig, pin: date) -> None:
-    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
-    raw_bytes = b"htop"
-    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
-    current = state.State()
-    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
-    state.add_sysext(
-        current,
-        _record(
-            "htop",
-            "3.5.1-1",
-            snapshot_id=snap_id,
-            sha=hashlib.sha256(raw_bytes).hexdigest(),
-            pinned_date=pin,
-        ),
-    )
-    state.add_user_request(
-        current,
-        state.UserRequest(
-            name="htop",
-            installed_version="3.5.1-1",
-            requested_at=_now(),
-            requirements={},
-        ),
-    )
-    state.save(current, config.state_db)
-
-
-def test_drift_hint_when_host_snapshot_advances(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Host DB has moved past the record's pinned_date — hint fires.
-
-    Drift is record-driven: time_sync.enabled in config is irrelevant.
-    """
-    config = _config(tmp_path)  # time_sync disabled by default
-    _seed_pinned_record(config, pin=date(2025, 5, 1))
-
-    monkeypatch.setattr(
-        "pacman_sysext.commands.status.time_sync.derive_snapshot_date",
-        lambda _path: date(2025, 5, 8),
-    )
-
-    console = _capturing_console()
-    status_cmd.run(config, console=console)
-    out = console.export_text()
-    assert "pinned to 2025-05-01" in out
-    assert "host snapshot is now 2025-05-08" in out
-
-
-def test_no_drift_hint_when_dates_align(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = _config(tmp_path)
-    _seed_pinned_record(config, pin=date(2025, 5, 1))
-
-    monkeypatch.setattr(
-        "pacman_sysext.commands.status.time_sync.derive_snapshot_date",
-        lambda _path: date(2025, 5, 1),
-    )
-
-    console = _capturing_console()
-    status_cmd.run(config, console=console)
-    out = console.export_text()
-    assert "Rebuild for ABI consistency" not in out
-
-
-def test_no_drift_hint_without_pinned_records(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No record carries pinned_date → no DB read, no hint, no I/O wasted."""
-    config = _config(tmp_path)
-    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
-    raw_bytes = b"htop"
-    (config.builder.output_dir / "htop-3.5.1-1.raw").write_bytes(raw_bytes)
-
-    current = state.State()
-    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
-    state.add_sysext(
-        current,
-        _record(
-            "htop",
-            "3.5.1-1",
-            snapshot_id=snap_id,
-            sha=hashlib.sha256(raw_bytes).hexdigest(),
-        ),
-    )
-    state.add_user_request(
-        current,
-        state.UserRequest(
-            name="htop",
-            installed_version="3.5.1-1",
-            requested_at=_now(),
-            requirements={},
-        ),
-    )
-    state.save(current, config.state_db)
-
-    calls: list[Path] = []
-
-    def derive_spy(path: Path) -> date:
-        calls.append(path)
-        return date(2099, 1, 1)
-
-    monkeypatch.setattr(
-        "pacman_sysext.commands.status.time_sync.derive_snapshot_date", derive_spy
-    )
-
-    console = _capturing_console()
-    status_cmd.run(config, console=console)
-    out = console.export_text()
-    assert "Rebuild for ABI consistency" not in out
-    # No pinned record → no DB read.
-    assert calls == []
-
-
-def test_drift_hint_fires_for_pinned_orphan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A pinned record kept around as an orphan still drifts.
-
-    Orphan sysexts stay on disk until removed and can be re-promoted via
-    a reinstall, so their pinned_date matters. The hint must reflect them
-    consistently with the derivation-gating logic.
-    """
-    config = _config(tmp_path)
-    config.builder.output_dir.mkdir(parents=True, exist_ok=True)
-    raw_bytes = b"orphan"
-    (config.builder.output_dir / "orphan-1.0-1.raw").write_bytes(raw_bytes)
-
-    current = state.State()
-    snap_id = state.intern_snapshot(current, {"glibc": "2.39-1"})
-    # No user request → record is an orphan.
-    state.add_sysext(
-        current,
-        _record(
-            "orphan",
-            "1.0-1",
-            snapshot_id=snap_id,
-            sha=hashlib.sha256(raw_bytes).hexdigest(),
-            pinned_date=date(2025, 5, 1),
-        ),
-    )
-    state.save(current, config.state_db)
-
-    monkeypatch.setattr(
-        "pacman_sysext.commands.status.time_sync.derive_snapshot_date",
-        lambda _path: date(2025, 5, 8),
-    )
-
-    console = _capturing_console()
-    status_cmd.run(config, console=console)
-    out = console.export_text()
-    assert "pinned to 2025-05-01" in out
-    assert "host snapshot is now 2025-05-08" in out
-
-
-def test_drift_hint_swallows_derive_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A broken /var/lib/pacman/sync must not crash status."""
-    from pacman_sysext.time_sync import TimeSyncError
-
-    config = _config(tmp_path)
-    _seed_pinned_record(config, pin=date(2025, 5, 1))
-
-    def boom(_path: Path) -> date:
-        raise TimeSyncError("simulated")
-
-    monkeypatch.setattr(
-        "pacman_sysext.commands.status.time_sync.derive_snapshot_date", boom
-    )
-
-    console = _capturing_console()
-    # Must not raise.
-    status_cmd.run(config, console=console)
-    out = console.export_text()
-    assert "Rebuild for ABI consistency" not in out
 
 
 def test_status_renders_scan_error_when_output_dir_unreadable(tmp_path: Path) -> None:

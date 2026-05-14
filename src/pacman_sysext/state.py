@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +72,6 @@ class SysextRecord:
     snapshot_id: str
     provides: dict[str, str]
     depends: list[str] = field(default_factory=list)
-    pinned_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -603,7 +602,6 @@ def _sysext_to_json(record: SysextRecord) -> dict[str, Any]:
         "snapshot_id": record.snapshot_id,
         "provides": dict(record.provides),
         "depends": list(record.depends),
-        "pinned_date": record.pinned_date.isoformat() if record.pinned_date else None,
     }
 
 
@@ -621,13 +619,6 @@ def _sysext_from_json(data: Any) -> SysextRecord:
     depends = data.get("depends", [])
     if not isinstance(depends, list):
         raise StateError(f"depends must be a list, got {type(depends).__name__}")
-    pinned_raw = data.get("pinned_date")
-    pinned_date: date | None = None
-    if pinned_raw is not None:
-        try:
-            pinned_date = date.fromisoformat(str(pinned_raw))
-        except ValueError as e:
-            raise StateError(f"invalid pinned_date: {pinned_raw!r}: {e}") from e
     return SysextRecord(
         name=data["name"],
         version=data["version"],
@@ -638,7 +629,6 @@ def _sysext_from_json(data: Any) -> SysextRecord:
         snapshot_id=data["snapshot_id"],
         provides={str(k): str(v) for k, v in provides.items()},
         depends=[str(d) for d in depends],
-        pinned_date=pinned_date,
     )
 
 

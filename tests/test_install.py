@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,12 +14,10 @@ import typer
 from pacman_sysext import state
 from pacman_sysext.commands import install
 from pacman_sysext.config import AppConfig, BuilderConfig, PacmanConfig, SysextConfig
-from pacman_sysext.pacman import ResolvedDep, parse_pkg_filename
-from pacman_sysext.time_sync import TimeSyncConfig
 from pacman_sysext.version import VersionConstraint
 
 
-def _config(tmp_path: Path, time_sync: TimeSyncConfig | None = None) -> AppConfig:
+def _config(tmp_path: Path) -> AppConfig:
     base = tmp_path
     return AppConfig(
         pacman=PacmanConfig(
@@ -31,29 +29,7 @@ def _config(tmp_path: Path, time_sync: TimeSyncConfig | None = None) -> AppConfi
         builder=BuilderConfig(output_dir=base / "sysexts"),
         sysext=SysextConfig(extensions_dir=base / "extensions"),
         state_db=base / "state.db",
-        time_sync=time_sync if time_sync is not None else TimeSyncConfig(),
     )
-
-
-def _resolved(*filenames: str, repo: str = "extra") -> list[ResolvedDep]:
-    """Build a ResolvedDep list mirroring `pacman -Sw --print` for tests.
-
-    Tests don't care about repo/url beyond the time-sync gate, so default
-    to `extra` and synthesize plausible URLs.
-    """
-    deps: list[ResolvedDep] = []
-    for filename in filenames:
-        name, version = parse_pkg_filename(filename)
-        deps.append(
-            ResolvedDep(
-                repo=repo,
-                name=name,
-                version=version,
-                url=f"https://mirror.example/{repo}/os/x86_64/{filename}",
-                filename=filename,
-            )
-        )
-    return deps
 
 
 def _seed_cache(cachedir: Path, filenames: Iterable[str]) -> None:
@@ -76,7 +52,7 @@ def mocked(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     mocks: dict[str, MagicMock] = {}
     for name in (
         "sync_databases",
-        "resolve_required_packages",
+        "get_required_packages",
         "get_package_dependencies",
         "get_package_provides",
         "get_base_snapshot",
@@ -114,10 +90,10 @@ class TestFreshInstall:
     ) -> None:
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
-        )
+        ]
 
         def deps_for(name: str, _config: object) -> list[VersionConstraint]:
             return {
@@ -163,9 +139,9 @@ class TestFreshInstall:
         """
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "grafana-12.4.2-1.1-x86_64_v4.pkg.tar.zst",
-        )
+        ]
         # pacman -Si reports the upstream version, intentionally divergent
         # from the filename pkgrel.
         mocked["get_package_dependencies"].return_value = []
@@ -187,10 +163,10 @@ class TestFreshInstall:
 
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
-        )
+        ]
 
         def deps_for(name: str, _config: object) -> list[VersionConstraint]:
             if name == "libcap":
@@ -245,11 +221,7 @@ class TestReinstall:
         )
         state.save(initial, config.state_db)
 
-        mocked["resolve_required_packages"].return_value = _resolved(
-
-            "htop-3.5.1-1-x86_64.pkg.tar.zst",
-
-        )
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -270,10 +242,10 @@ class TestHostSatisfied:
     ) -> None:
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         # only htop is unsatisfied; libcap is on host
         mocked["find_unsatisfied"].return_value = {"htop"}
@@ -320,10 +292,10 @@ class TestSysextReuse:
         )
         state.save(initial, config.state_db)
 
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
         _seed_cache(
@@ -366,10 +338,10 @@ class TestSysextReuse:
         )
         state.save(initial, config.state_db)
 
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
         _seed_cache(
@@ -413,9 +385,7 @@ class TestConflict:
         before = config.state_db.read_text()
 
         # Now install nodejs which wants libuv>=2.0
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "nodejs-22-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["nodejs-22-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = [
             VersionConstraint("libuv", ">=", "2.0"),
         ]
@@ -436,9 +406,7 @@ class TestBuildFailure:
     ) -> None:
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "htop-3.5.1-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -480,9 +448,7 @@ class TestDriftWarning:
         state.save(initial, config.state_db)
 
         mocked["get_base_snapshot"].return_value = {"glibc": "2.40-1"}
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "nano-7-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["nano-7-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"nano"}
         _seed_cache(config.pacman.cachedir, ["nano-7-1-x86_64.pkg.tar.zst"])
@@ -517,9 +483,7 @@ class TestDriftWarning:
         state.save(initial, config.state_db)
 
         mocked["get_base_snapshot"].return_value = {"glibc": "2.40-1"}
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "nano-7-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["nano-7-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"nano"}
         _seed_cache(config.pacman.cachedir, ["nano-7-1-x86_64.pkg.tar.zst"])
@@ -535,9 +499,7 @@ class TestDriftWarning:
     ) -> None:
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "nano-7-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["nano-7-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"nano"}
         _seed_cache(config.pacman.cachedir, ["nano-7-1-x86_64.pkg.tar.zst"])
@@ -554,11 +516,11 @@ class TestSnapshotInterning:
     ) -> None:
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
             "libnl-3.7-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap", "libnl"}
         _seed_cache(
@@ -584,9 +546,7 @@ class TestLocking:
     ) -> None:
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "htop-3.5.1-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -685,11 +645,7 @@ class TestTargetReuse:
         )
         state.save(initial, config.state_db)
 
-        mocked["resolve_required_packages"].return_value = _resolved(
-
-            "htop-3.5.1-1-x86_64.pkg.tar.zst",
-
-        )
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -720,10 +676,10 @@ class TestOrphanCleanup:
             return _fake_build(pkg_path, output_dir, fs_format)
 
         mocked["build_sysext"].side_effect = build_then_fail
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop", "libcap"}
         _seed_cache(
@@ -774,11 +730,7 @@ class TestConflictMessage:
         )
         state.save(initial, config.state_db)
 
-        mocked["resolve_required_packages"].return_value = _resolved(
-
-            "nodejs-22-1-x86_64.pkg.tar.zst",
-
-        )
+        mocked["get_required_packages"].return_value = ["nodejs-22-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = [
             VersionConstraint("libuv", ">=", "2.0"),
         ]
@@ -808,9 +760,7 @@ class TestAssumeYes:
 
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "htop-3.5.1-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         mocked["find_unsatisfied"].return_value = {"htop"}
         _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
@@ -838,10 +788,10 @@ class TestAbiGatekeeper:
         host has glib2 2.78, but the resolved tree wants 2.80 — the gate
         must block this.
         """
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "okular-24.12.1-1-x86_64.pkg.tar.zst",
             "glib2-2.80.2-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         # Both names exist on host (so they're in host_provided via -T),
         # but glib2's version doesn't match the resolved tree.
@@ -884,12 +834,12 @@ class TestAbiGatekeeper:
     ) -> None:
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "okular-24.12-1-x86_64.pkg.tar.zst",
             "glib2-2.80-1-x86_64.pkg.tar.zst",
             "systemd-libs-257-1-x86_64.pkg.tar.zst",
             "pam-1.6.2-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         mocked["query_system_packages"].return_value = {
             "glib2": "2.78-1",
@@ -945,10 +895,10 @@ class TestAbiGatekeeper:
         """Cosmetic drift (fonts/icons) takes the shadow path, not block."""
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "okular-24.12-1-x86_64.pkg.tar.zst",
             "ttf-dejavu-2.38-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         mocked["query_system_packages"].return_value = {"ttf-dejavu": "2.37-1"}
         _seed_cache(
@@ -978,10 +928,10 @@ class TestAbiGatekeeper:
         """
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "htop-3.5.1-1-x86_64.pkg.tar.zst",
             "libcap-2.78-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = []
         mocked["query_system_packages"].return_value = {"libcap": "2.78-1"}
         # libcap is on host; pacman -T agrees. Only target is unsatisfied.
@@ -1008,9 +958,7 @@ class TestAbiGatekeeper:
         """User-requested target always becomes a sysext — that's the point."""
         config = _config(tmp_path)
         _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "htop-3.5.1-1-x86_64.pkg.tar.zst",
-        )
+        mocked["get_required_packages"].return_value = ["htop-3.5.1-1-x86_64.pkg.tar.zst"]
         mocked["get_package_dependencies"].return_value = []
         # Host has an older htop. User wants the newer one as a sysext.
         mocked["query_system_packages"].return_value = {"htop": "3.4.0-1"}
@@ -1050,10 +998,10 @@ class TestAbiGatekeeper:
         )
         state.save(initial, config.state_db)
 
-        mocked["resolve_required_packages"].return_value = _resolved(
+        mocked["get_required_packages"].return_value = [
             "nodejs-22-1-x86_64.pkg.tar.zst",
             "glib2-2.80-1-x86_64.pkg.tar.zst",
-        )
+        ]
         mocked["get_package_dependencies"].return_value = [
             VersionConstraint("libuv", ">=", "2.0"),
         ]
@@ -1094,162 +1042,3 @@ class TestConstraintsOverlap:
         assert not install._constraints_overlap(
             VersionConstraint("x", "=", "1.0"), VersionConstraint("x", "=", "2.0")
         )
-
-
-class TestTimeSyncInstall:
-    """Time-sync wiring: sandbox preparation + strict policy gate."""
-
-    def _seed_sandbox(self, sandbox_cache: Path, filenames: Iterable[str]) -> None:
-        sandbox_cache.mkdir(parents=True, exist_ok=True)
-        for f in filenames:
-            (sandbox_cache / f).write_bytes(b"fake package")
-
-    def test_disabled_keeps_phase_one_flow(
-        self, tmp_path: Path, mocked: dict[str, MagicMock]
-    ) -> None:
-        """Regression guard: time_sync.enabled = false must not change behaviour."""
-        config = _config(tmp_path)
-        _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = _resolved(
-            "htop-3.5.1-1-x86_64.pkg.tar.zst",
-        )
-        mocked["get_package_dependencies"].return_value = []
-        mocked["find_unsatisfied"].return_value = {"htop"}
-        _seed_cache(config.pacman.cachedir, ["htop-3.5.1-1-x86_64.pkg.tar.zst"])
-
-        with patch("pacman_sysext.commands.install.time_sync.prepare_sandbox") as prep:
-            install.run("htop", config)
-        # Sandbox prep must NOT be called when time_sync is disabled.
-        prep.assert_not_called()
-        # Plain sync_databases path stays in use.
-        mocked["sync_databases"].assert_called_once()
-
-    def test_strict_block_on_unmapped_repo_skips_download(
-        self,
-        tmp_path: Path,
-        mocked: dict[str, MagicMock],
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        config = _config(
-            tmp_path,
-            TimeSyncConfig(
-                enabled=True,
-                snapshot_servers={"core": "https://archive.example/{date}/{repo}/{arch}"},
-            ),
-        )
-        _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = [
-            *_resolved("htop-3.5.1-1-x86_64.pkg.tar.zst", repo="extra"),
-        ]
-        mocked["get_package_dependencies"].return_value = []
-        mocked["find_unsatisfied"].return_value = {"htop"}
-
-        sandbox_pacman = PacmanConfig(
-            dbpath=tmp_path / "sandbox" / "db",
-            cachedir=tmp_path / "sandbox" / "cache",
-            config_file=tmp_path / "sandbox" / "pacman.conf",
-            gpgdir=tmp_path / "gnupg",
-        )
-        from pacman_sysext.time_sync import PreparedSandbox
-
-        prepared = PreparedSandbox(pacman=sandbox_pacman, effective_date=date(2025, 5, 1))
-        with (
-            patch(
-                "pacman_sysext.commands.install.time_sync.prepare_sandbox",
-                return_value=prepared,
-            ),
-            pytest.raises(typer.Exit) as exc_info,
-        ):
-            install.run("htop", config)
-
-        assert exc_info.value.exit_code == 1
-        out = capsys.readouterr().out
-        assert "SNAPSHOT POLICY BLOCK" in out
-        assert "htop" in out
-        assert "'extra'" in out
-        # Bandwidth gate: we must not pull anything for a blocked install.
-        mocked["download_package"].assert_not_called()
-        mocked["build_sysext"].assert_not_called()
-        # State must be untouched.
-        assert not config.state_db.exists()
-
-    def test_all_mapped_proceeds_through_sandbox(
-        self, tmp_path: Path, mocked: dict[str, MagicMock]
-    ) -> None:
-        config = _config(
-            tmp_path,
-            TimeSyncConfig(
-                enabled=True,
-                snapshot_servers={
-                    "core": "https://archive.example/{date}/{repo}/{arch}",
-                    "extra": "https://archive.example/{date}/{repo}/{arch}",
-                },
-            ),
-        )
-        _set_defaults(mocked)
-        mocked["resolve_required_packages"].return_value = [
-            *_resolved("glibc-2.39-1-x86_64.pkg.tar.zst", repo="core"),
-            *_resolved("htop-3.5.1-1-x86_64.pkg.tar.zst", repo="extra"),
-        ]
-        mocked["get_package_dependencies"].return_value = []
-        mocked["find_unsatisfied"].return_value = {"htop", "glibc"}
-
-        sandbox_pacman = PacmanConfig(
-            dbpath=tmp_path / "sandbox" / "db",
-            cachedir=tmp_path / "sandbox" / "cache",
-            config_file=tmp_path / "sandbox" / "pacman.conf",
-            gpgdir=tmp_path / "gnupg",
-        )
-        from pacman_sysext.time_sync import PreparedSandbox
-
-        prepared = PreparedSandbox(pacman=sandbox_pacman, effective_date=date(2025, 5, 1))
-        self._seed_sandbox(
-            sandbox_pacman.cachedir,
-            ["glibc-2.39-1-x86_64.pkg.tar.zst", "htop-3.5.1-1-x86_64.pkg.tar.zst"],
-        )
-
-        with patch(
-            "pacman_sysext.commands.install.time_sync.prepare_sandbox",
-            return_value=prepared,
-        ) as prep:
-            install.run("htop", config)
-
-        prep.assert_called_once_with(config.time_sync, config.pacman)
-        # download_package was called against the sandbox config, not the
-        # base /var/lib/pacman-sysext cachedir.
-        assert mocked["download_package"].call_args[0][1] is sandbox_pacman
-        # State landed and every record carries the pinned date.
-        result = state.load(config.state_db)
-        assert "htop" in result.user_requests
-        assert {"glibc-2.39-1", "htop-3.5.1-1"} == set(result.sysexts.keys())
-        for record in result.sysexts.values():
-            assert record.pinned_date == date(2025, 5, 1)
-
-    def test_prepare_sandbox_failure_surfaces_cleanly(
-        self,
-        tmp_path: Path,
-        mocked: dict[str, MagicMock],
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        from pacman_sysext.time_sync import TimeSyncError
-
-        config = _config(
-            tmp_path,
-            TimeSyncConfig(enabled=True, snapshot_servers={"core": "https://x/{date}"}),
-        )
-        _set_defaults(mocked)
-
-        with (
-            patch(
-                "pacman_sysext.commands.install.time_sync.prepare_sandbox",
-                side_effect=TimeSyncError("no snapshot reachable"),
-            ),
-            pytest.raises(typer.Exit) as exc_info,
-        ):
-            install.run("htop", config)
-
-        assert exc_info.value.exit_code == 1
-        out = capsys.readouterr().out
-        assert "no snapshot reachable" in out
-        mocked["download_package"].assert_not_called()
-        assert not config.state_db.exists()

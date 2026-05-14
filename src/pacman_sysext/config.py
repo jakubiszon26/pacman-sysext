@@ -1,21 +1,15 @@
 """Application configuration."""
 
-from __future__ import annotations
-
 import tomllib
 from dataclasses import dataclass, replace
-from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, get_args, get_type_hints
-
-if TYPE_CHECKING:
-    from pacman_sysext.time_sync import TimeSyncConfig
+from typing import Any, Literal, get_args, get_type_hints
 
 FsFormat = Literal["erofs", "squashfs"]
 _VALID_FS_FORMATS = frozenset(get_args(FsFormat))
 
 _DEFAULT_CONFIG_PATH = Path("/etc/pacman-sysext/config.toml")
-_KNOWN_TOP_LEVEL = frozenset({"pacman", "builder", "sysext", "state_db", "time_sync"})
+_KNOWN_TOP_LEVEL = frozenset({"pacman", "builder", "sysext", "state_db"})
 
 
 class ConfigError(Exception):
@@ -81,13 +75,10 @@ class AppConfig:
     builder: BuilderConfig
     sysext: SysextConfig
     state_db: Path
-    time_sync: TimeSyncConfig
 
     @classmethod
-    def default(cls) -> AppConfig:
+    def default(cls) -> "AppConfig":
         """Default configuration using FHS-style paths under /var/lib/pacman-sysext."""
-        from pacman_sysext.time_sync import TimeSyncConfig
-
         base = Path("/var/lib/pacman-sysext")
         return cls(
             pacman=PacmanConfig(
@@ -99,11 +90,10 @@ class AppConfig:
             builder=BuilderConfig(output_dir=base / "sysexts"),
             sysext=SysextConfig(),
             state_db=base / "state.db",
-            time_sync=TimeSyncConfig(),
         )
 
     @classmethod
-    def load(cls, path: Path | None = None) -> AppConfig:
+    def load(cls, path: Path | None = None) -> "AppConfig":
         """Load config from TOML, falling back to defaults.
 
         Missing keys in the file inherit from `default()`. An explicitly
@@ -127,7 +117,7 @@ class AppConfig:
 
         return cls.default()._merge(data)
 
-    def _merge(self, data: dict[str, Any]) -> AppConfig:
+    def _merge(self, data: dict[str, Any]) -> "AppConfig":
         unknown = set(data) - _KNOWN_TOP_LEVEL
         if unknown:
             raise ConfigError(
@@ -142,7 +132,6 @@ class AppConfig:
             builder=_merge_dataclass("builder", self.builder, data.get("builder")),
             sysext=_merge_dataclass("sysext", self.sysext, data.get("sysext")),
             state_db=state_db,
-            time_sync=_merge_time_sync(self.time_sync, data.get("time_sync")),
         )
 
 
@@ -165,65 +154,6 @@ def _coerce_path(qualified_name: str, value: Any) -> Path:
         raise ConfigError(
             f"Invalid value for {qualified_name}: expected path string, got {type(value).__name__}"
         ) from e
-
-
-_TIME_SYNC_KNOWN_KEYS = frozenset({"enabled", "date", "policy", "snapshot_servers"})
-
-
-def _merge_time_sync(
-    current: TimeSyncConfig, overrides: dict[str, Any] | None
-) -> TimeSyncConfig:
-    """Apply `[time_sync]` overrides, coercing `date` and validating subtable shape."""
-    from pacman_sysext.time_sync import TimeSyncError
-
-    if not overrides:
-        return current
-    unknown = set(overrides) - _TIME_SYNC_KNOWN_KEYS
-    if unknown:
-        raise ConfigError(
-            f"Unknown key in [time_sync]: {sorted(unknown)}. Known: {sorted(_TIME_SYNC_KNOWN_KEYS)}"
-        )
-    kwargs: dict[str, Any] = {}
-    if "enabled" in overrides:
-        kwargs["enabled"] = overrides["enabled"]
-    if "policy" in overrides:
-        kwargs["policy"] = overrides["policy"]
-    if "date" in overrides:
-        kwargs["date"] = _coerce_date(overrides["date"])
-    if "snapshot_servers" in overrides:
-        servers = overrides["snapshot_servers"]
-        if not isinstance(servers, dict):
-            raise ConfigError(
-                "[time_sync.snapshot_servers] must be a table of repo -> template, "
-                f"got {type(servers).__name__}"
-            )
-        for repo, template in servers.items():
-            if not isinstance(repo, str) or not isinstance(template, str):
-                raise ConfigError(
-                    "[time_sync.snapshot_servers] entries must be string -> string"
-                )
-        kwargs["snapshot_servers"] = dict(servers)
-    try:
-        return replace(current, **kwargs)
-    except TimeSyncError as e:
-        raise ConfigError(f"invalid [time_sync]: {e}") from e
-    except TypeError as e:
-        raise ConfigError(f"invalid [time_sync]: {e}") from e
-
-
-def _coerce_date(value: Any) -> date | None:
-    if value is None:
-        return None
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str):
-        try:
-            return date.fromisoformat(value)
-        except ValueError as e:
-            raise ConfigError(f"invalid time_sync.date: {value!r}: {e}") from e
-    raise ConfigError(
-        f"time_sync.date must be a date or ISO string, got {type(value).__name__}"
-    )
 
 
 def _merge_dataclass[T](section: str, current: T, overrides: dict[str, Any] | None) -> T:
