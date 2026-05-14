@@ -15,3 +15,5 @@ wheels/
 
 # Scratch design/audit notes — kept locally, not part of repo history.
 *.plan
+
+docs/

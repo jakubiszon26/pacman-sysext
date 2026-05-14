@@ -167,7 +167,7 @@ def resolve_required_packages(package: str, config: PacmanConfig) -> list[Resolv
     Backed by `pacman -Sw <pkg> --print --print-format "%r|%n|%v|%l"`. The
     repo source (`%r`) is the authoritative classification — far cheaper
     than N follow-up `pacman -Si` probes and semantically correct for
-    time-sync repo policy gating.
+    classifying deps by their origin repo.
 
     The field separator is `|` rather than `\\t` because some immutable
     distros (Arkane, Garuda-immutable, …) ship `/usr/bin/pacman` as a
